@@ -592,3 +592,5 @@ class PPO_RNN(Agent):
 
         if self.scheduler:
             self.track_data("Learning / Learning rate", self.scheduler.get_last_lr()[0])
+
+        self.memory.reset()
