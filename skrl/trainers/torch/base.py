@@ -240,7 +240,12 @@ class Trainer(ABC):
                 if self.cfg.environment_info in infos:
                     for k, v in infos[self.cfg.environment_info].items():
                         if isinstance(v, torch.Tensor) and v.numel() == 1:
-                            self.agents.track_data(k if "/" in k else f"Info / {k}", v.item())
+                            self.agents.track_data(f"Info / {k}", v.item())
+                        elif isinstance(v, list) and len(v) >= 1:
+                            for v_ in v:
+                                self.agents.track_data(f"Info / {k}", v_)
+                                self.agents.track_data(f"Info / {k} (min)", v_)
+                                self.agents.track_data(f"Info / {k} (max)", v_)
 
             # post-interaction
             self.agents.post_interaction(timestep=timestep, timesteps=self.cfg.timesteps)
