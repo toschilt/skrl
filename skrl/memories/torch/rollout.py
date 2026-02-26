@@ -72,27 +72,41 @@ class RolloutBuffer:
     def add_samples(self, **tensors):
         """
         Store one transition per environment.
-        Ensures all stored data are PyTorch Tensors.
+
+        Guarantees:
+        - Multimodal data (list of tensors) keeps its structure
+        - Per-env tensors are sliced correctly
+        - Only leaf values are converted to tensors
+        - Prevents silent shape corruption (critical for PPO_RNN)
         """
 
+        # --------------------------------------------------
         # 1. Infer batch size
+        # --------------------------------------------------
         batch_size = None
+
         for v in tensors.values():
             if isinstance(v, torch.Tensor):
                 batch_size = v.shape[0]
                 break
-        
-        # Fallback: Check for lists/tuples
+
         if batch_size is None:
             for v in tensors.values():
                 if isinstance(v, (list, tuple)):
+                    # multimodal case: list of tensors
+                    if len(v) > 0 and isinstance(v[0], torch.Tensor):
+                        batch_size = v[0].shape[0]
+                        break
+                    # per-env list
                     batch_size = len(v)
                     break
 
         if batch_size is None or batch_size == 0:
             return
 
-        # 2. Store data
+        # --------------------------------------------------
+        # 2. Store data per environment
+        # --------------------------------------------------
         for env in range(batch_size):
             transition = {}
 
@@ -100,35 +114,49 @@ class RolloutBuffer:
                 if value is None:
                     continue
 
-                # --- Step A: Extract the specific value for this env ---
+                # ------------------------------------------
+                # Case A: tensor batch [B, ...]
+                # ------------------------------------------
                 if isinstance(value, torch.Tensor):
-                    val = value[env]
-                elif isinstance(value, (list, tuple)):
-                    if len(value) == batch_size:
-                        # assume that the list is per-env
-                        val = value[env]
-                    elif isinstance(value[0], torch.Tensor):
-                        # if it's a list of tensors, assume they are not the same shape
-                        val = []
-                        for v in value:
-                            val.append(v[env])  # add batch dim for stacking later
-                else:
-                    # Fallback for scalars or non-batched info
-                    val = value
+                    val = value[env].detach().to(self.device)
 
-                # --- Step B: CONVERSION TO TENSOR (if possible) ---
-                # This fixes the "got list" or "got numpy" error in torch.stack later
-                if isinstance(val, torch.Tensor):
-                    val = val.detach().to(self.device)
+                # ------------------------------------------
+                # Case B: list / tuple
+                # ------------------------------------------
+                elif isinstance(value, (list, tuple)):
+
+                    # 🔥 MULTIMODAL: list of tensors
+                    if len(value) > 0 and isinstance(value[0], torch.Tensor):
+                        val = [
+                            v[env].detach().to(self.device)
+                            for v in value
+                        ]
+
+                    # 🔹 Per-env list
+                    elif len(value) == batch_size:
+                        val = value[env]
+
+                        # convert leaf if possible
+                        if isinstance(val, torch.Tensor):
+                            val = val.detach().to(self.device)
+                        else:
+                            try:
+                                val = torch.as_tensor(val, device=self.device)
+                            except Exception:
+                                pass
+
+                    # 🔹 Fallback (rare)
+                    else:
+                        val = value
+
+                # ------------------------------------------
+                # Case C: scalar / numpy / etc.
+                # ------------------------------------------
                 else:
-                    # Convert lists, numpy arrays, floats, ints to Tensor
                     try:
-                        val = torch.tensor(val, device=self.device)
+                        val = torch.as_tensor(value, device=self.device)
                     except Exception:
-                        # If conversion fails (e.g. arbitrary info dicts), store as is.
-                        # Note: sample_all will still fail if this name is requested for training,
-                        # but this prevents crashing on 'info' fields.
-                        pass
+                        val = value
 
                 transition[name] = val
 
@@ -234,7 +262,6 @@ class RolloutBuffer:
                     else:
                         raise TypeError(f"Unexpected type in flat tensors: {type(data)}")
                 batches.append(batch)
-
             return batches
 
     def _build_flat_tensors(self, names):
@@ -285,7 +312,7 @@ class RolloutBuffer:
                     
                     # Stack each modality over time dimension T
                     per_env.append([torch.stack(modality, dim=0) for modality in modality_lists])
-
+                    
             # stack envs then flatten
             if isinstance(per_env[0], torch.Tensor):
                 stacked = torch.stack(per_env, dim=1)  # [T, E, ...]

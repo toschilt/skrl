@@ -7,6 +7,7 @@ import gymnasium
 from packaging import version
 
 import torch
+from torch.distributions import Categorical
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -257,7 +258,11 @@ class PPO_RNN(Agent):
         # sample random actions
         # TODO, check for stochasticity
         if timestep < self.cfg.random_timesteps:
-            return self.policy.random_act(inputs, role="policy")
+            actions, outputs = self.policy.random_act(inputs, role="policy")
+            self._current_log_prob = outputs.get("log_prob", None)
+            if self._rnn:
+                self._rnn_final_states["policy"] = outputs.get("rnn", self._rnn_initial_states["policy"])
+            return actions, outputs
 
         # sample stochastic actions
         with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
@@ -588,7 +593,13 @@ class PPO_RNN(Agent):
                 "Loss / Entropy loss", cumulative_entropy_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
             )
 
-        self.track_data("Policy / Standard deviation", self.policy.distribution(role="policy").stddev.mean().item())
+        dist = self.policy.distribution(role="policy")
+        if hasattr(dist, "stddev"):  # continuous
+            std = dist.stddev.mean().item()
+            self.track_data("Policy / Standard deviation", std)
+        elif isinstance(dist, Categorical):  # discrete
+            entropy = dist.entropy().mean().item()
+            self.track_data("Policy / Entropy", entropy)
 
         if self.scheduler:
             self.track_data("Learning / Learning rate", self.scheduler.get_last_lr()[0])
