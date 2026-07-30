@@ -1,7 +1,7 @@
-"""Purpose: Implement Discrete SAC, including nested replay and masked-action compatibility.
+"""Purpose: Implement environment-agnostic Discrete SAC with nested replay compatibility.
 
 Usage: Construct ``DiscreteSAC`` with discrete policy/critic models whose policy
-outputs either ``probs`` and ``log_probs`` or logits under ``logits``/``net_output``.
+outputs a distribution or logits and may include a generic ``invalid_action_mask``.
 """
 
 from __future__ import annotations
@@ -165,54 +165,6 @@ class DiscreteSAC(Agent):
 
     def _get_states(self, observations: torch.Tensor, states: torch.Tensor | None) -> torch.Tensor:
         return observations if states is None else states
-
-    @staticmethod
-    def _build_discrete_invalid_mask_from_states(states: Any) -> torch.Tensor | None:
-        """Extract an ARIADNE invalid-position mask while retaining one safe action."""
-        if not isinstance(states, (list, tuple)) or len(states) < 8:
-            return None
-
-        # Supported layouts:
-        # old: [node, pad, orientation, edge, idx, ori_idx, current_edge, edge_pad, ...]
-        # new: [node_base, node_aux, pad, orientation, edge, idx, ori_idx, current_edge, edge_pad, ...]
-        if len(states) >= 9:
-            current_edge = states[7]
-            edge_padding_mask = states[8]
-        else:
-            current_edge = states[6]
-            edge_padding_mask = states[7]
-        node_inputs = states[0]
-
-        if not (torch.is_tensor(current_edge) and torch.is_tensor(edge_padding_mask) and torch.is_tensor(node_inputs)):
-            return None
-        if node_inputs.dim() < 2:
-            return None
-
-        if current_edge.dim() == 2:
-            current_edge = current_edge.unsqueeze(-1)
-        elif current_edge.dim() != 3 or current_edge.shape[-1] != 1:
-            return None
-
-        if edge_padding_mask.dim() == 3 and edge_padding_mask.shape[1] == 1:
-            invalid_mask = edge_padding_mask.squeeze(1)
-        elif edge_padding_mask.dim() == 2:
-            invalid_mask = edge_padding_mask
-        else:
-            return None
-        if invalid_mask.shape[1] == 0:
-            return None
-
-        edge_out_of_range = (current_edge < 0) | (current_edge >= node_inputs.shape[1])
-        edge_out_of_range = edge_out_of_range.squeeze(-1)
-        if invalid_mask.shape != edge_out_of_range.shape:
-            return None
-
-        # Clone so the all-invalid fallback never mutates a replay sample view.
-        invalid_mask = invalid_mask.bool().clone() | edge_out_of_range
-        all_invalid = invalid_mask.all(dim=1)
-        if all_invalid.any():
-            invalid_mask[all_invalid, 0] = False
-        return invalid_mask
 
     @staticmethod
     def _sanitize_discrete_action_indices(
@@ -402,6 +354,7 @@ class DiscreteSAC(Agent):
 
                 _, outputs = self.policy.act(inputs, role="policy")
                 action_probs, action_log_probs = self._action_distribution_from_outputs(outputs)
+                invalid_action_mask = outputs.get("invalid_action_mask", None)
 
                 with torch.no_grad():
                     critic_1_values, _ = self.critic_1.act(inputs, role="critic_1")
@@ -457,9 +410,8 @@ class DiscreteSAC(Agent):
                 if gather_index.dim() == 1:
                     gather_index = gather_index.unsqueeze(1)
 
-                invalid_mask = self._build_discrete_invalid_mask_from_states(sampled_states)
                 gather_index = self._sanitize_discrete_action_indices(
-                    gather_index, invalid_mask, num_actions=critic_1_values.shape[1]
+                    gather_index, invalid_action_mask, num_actions=critic_1_values.shape[1]
                 )
 
                 critic_1_values = torch.gather(critic_1_values, 1, gather_index)

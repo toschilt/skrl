@@ -24,7 +24,7 @@ def _batch_size(inputs: dict[str, Any]) -> int:
 
 
 class _SyntheticPolicy(Model):
-    def __init__(self, contract: str) -> None:
+    def __init__(self, contract: str, invalid_action_mask: torch.Tensor | None = None) -> None:
         super().__init__(
             observation_space=gymnasium.spaces.Box(low=-1, high=1, shape=(2,)),
             action_space=gymnasium.spaces.Discrete(3),
@@ -32,6 +32,7 @@ class _SyntheticPolicy(Model):
         )
         self.contract = contract
         self.logits = torch.nn.Parameter(torch.tensor([0.2, -0.1, 0.5]))
+        self.register_buffer("invalid_action_mask", invalid_action_mask)
 
     def compute(self, inputs: dict[str, Any], role: str = "") -> tuple[torch.Tensor, dict[str, Any]]:
         raise NotImplementedError
@@ -45,6 +46,8 @@ class _SyntheticPolicy(Model):
             }
         else:
             outputs = {self.contract: logits}
+        if self.invalid_action_mask is not None:
+            outputs["invalid_action_mask"] = self.invalid_action_mask[: logits.shape[0]]
         return logits.argmax(dim=-1, keepdim=True), outputs
 
 
@@ -73,33 +76,22 @@ class _SyntheticReplay:
         return [self.sample_value]
 
 
-def _ariadne_states(*, new_layout: bool = True) -> list[torch.Tensor]:
-    batch_size, num_nodes = 3, 4
-    node_inputs = torch.arange(batch_size * num_nodes * 2, dtype=torch.float32).reshape(batch_size, num_nodes, 2)
-    current_edge = torch.tensor(
+def _invalid_action_mask() -> torch.Tensor:
+    return torch.tensor(
         [
-            [[0], [1], [2]],
-            [[0], [1], [2]],
-            [[0], [1], [2]],
+            [False, True, False],
+            [True, True, True],
+            [False, False, False],
         ]
     )
-    edge_padding_mask = torch.tensor(
-        [
-            [[False, True, False]],
-            [[True, True, True]],
-            [[False, False, False]],
-        ]
-    )
-    filler = [torch.zeros(batch_size, 1) for _ in range(5)]
-    if new_layout:
-        return [
-            node_inputs,
-            node_inputs.clone(),
-            *filler,
-            current_edge,
-            edge_padding_mask,
-        ]
-    return [node_inputs, *filler, current_edge, edge_padding_mask]
+
+
+def _nested_states() -> list[Any]:
+    return [
+        torch.arange(24, dtype=torch.float32).reshape(3, 4, 2),
+        {"context": torch.ones(3, 2)},
+        (torch.zeros(3, 1), [torch.full((3, 2), 2.0)]),
+    ]
 
 
 def _nested_replay_sample() -> tuple[Any, ...]:
@@ -107,25 +99,24 @@ def _nested_replay_sample() -> tuple[Any, ...]:
         "features": torch.arange(6, dtype=torch.float32).reshape(3, 2),
         "history": (torch.ones(3, 1), [torch.zeros(3, 2)]),
     }
-    states = _ariadne_states()
     return (
         observations,
-        states,
+        _nested_states(),
         torch.tensor([[1.0], [99.0], [-4.0]]),
         torch.tensor([[1.0], [0.5], [-0.5]]),
         {
             "features": observations["features"] + 1,
             "history": (torch.full((3, 1), 2.0), [torch.full((3, 2), 3.0)]),
         },
-        [tensor.clone() for tensor in states],
+        _nested_states(),
         torch.zeros(3, 1, dtype=torch.bool),
         torch.zeros(3, 1, dtype=torch.bool),
     )
 
 
-def _make_agent(contract: str, sample: tuple[Any, ...]) -> DiscreteSAC:
+def _make_agent(contract: str, sample: tuple[Any, ...], invalid_action_mask: torch.Tensor) -> DiscreteSAC:
     models = {
-        "policy": _SyntheticPolicy(contract),
+        "policy": _SyntheticPolicy(contract, invalid_action_mask),
         "critic_1": _SyntheticCritic(),
         "critic_2": _SyntheticCritic(),
         "target_critic_1": _SyntheticCritic(),
@@ -205,41 +196,39 @@ def test_incomplete_distribution_contract_is_rejected() -> None:
         DiscreteSAC._action_distribution_from_outputs({"probs": torch.tensor([[0.5, 0.5]])})
 
 
-@pytest.mark.parametrize("new_layout", [False, True])
-def test_ariadne_mask_sanitizes_invalid_and_out_of_range_actions(new_layout: bool) -> None:
-    states = _ariadne_states(new_layout=new_layout)
-    replay_padding_mask = states[8 if new_layout else 7]
-    original_padding_mask = replay_padding_mask.clone()
-
-    invalid_mask = DiscreteSAC._build_discrete_invalid_mask_from_states(states)
+def test_policy_mask_sanitizes_invalid_and_out_of_range_actions_without_mutation() -> None:
+    invalid_mask = _invalid_action_mask()
+    original_invalid_mask = invalid_mask.clone()
     sanitized = DiscreteSAC._sanitize_discrete_action_indices(
         torch.tensor([[1], [99], [-4]]), invalid_mask, num_actions=3
     )
 
-    torch.testing.assert_close(
-        invalid_mask,
-        torch.tensor(
-            [
-                [False, True, False],
-                [False, True, True],
-                [False, False, False],
-            ]
-        ),
-    )
     torch.testing.assert_close(sanitized, torch.tensor([[0], [0], [0]]))
-    torch.testing.assert_close(replay_padding_mask, original_padding_mask)
+    torch.testing.assert_close(invalid_mask, original_invalid_mask)
 
 
-def test_out_of_range_actions_are_safe_without_ariadne_mask() -> None:
+def test_all_invalid_policy_mask_retains_one_safe_action() -> None:
+    invalid_mask = torch.ones(2, 3, dtype=torch.bool)
+    original_invalid_mask = invalid_mask.clone()
+
+    sanitized = DiscreteSAC._sanitize_discrete_action_indices(torch.tensor([[2], [0]]), invalid_mask, num_actions=3)
+
+    torch.testing.assert_close(sanitized, torch.tensor([[0], [0]]))
+    torch.testing.assert_close(invalid_mask, original_invalid_mask)
+
+
+def test_out_of_range_actions_are_safe_without_policy_mask() -> None:
     sanitized = DiscreteSAC._sanitize_discrete_action_indices(torch.tensor([[-1], [3], [2]]), None, num_actions=3)
     torch.testing.assert_close(sanitized, torch.tensor([[0], [0], [2]]))
 
 
-def test_update_accepts_equivalent_contracts_and_all_invalid_replay_masks() -> None:
+def test_update_accepts_equivalent_contracts_and_all_invalid_policy_masks() -> None:
     distribution_sample = _nested_replay_sample()
     logits_sample = _nested_replay_sample()
-    distribution_agent = _make_agent("distribution", distribution_sample)
-    logits_agent = _make_agent("logits", logits_sample)
+    distribution_mask = _invalid_action_mask()
+    logits_mask = _invalid_action_mask()
+    distribution_agent = _make_agent("distribution", distribution_sample, distribution_mask)
+    logits_agent = _make_agent("logits", logits_sample, logits_mask)
 
     distribution_agent.update(timestep=0, timesteps=1)
     logits_agent.update(timestep=0, timesteps=1)
@@ -251,6 +240,6 @@ def test_update_accepts_equivalent_contracts_and_all_invalid_replay_masks() -> N
         for name in distribution_parameters:
             torch.testing.assert_close(distribution_parameters[name], logits_parameters[name])
 
-    # The all-invalid replay row retains its original mask; the safe action exists only in the derived clone.
-    torch.testing.assert_close(distribution_sample[1][8][1], torch.tensor([[True, True, True]]))
-    torch.testing.assert_close(logits_sample[1][8][1], torch.tensor([[True, True, True]]))
+    # The all-invalid row remains unchanged; the safe fallback exists only in the sanitizer's clone.
+    torch.testing.assert_close(distribution_mask[1], torch.tensor([True, True, True]))
+    torch.testing.assert_close(logits_mask[1], torch.tensor([True, True, True]))
