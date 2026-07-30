@@ -1,3 +1,9 @@
+"""Purpose: Implement Discrete SAC, including nested replay and masked-action compatibility.
+
+Usage: Construct ``DiscreteSAC`` with discrete policy/critic models whose policy
+outputs either ``probs`` and ``log_probs`` or logits under ``logits``/``net_output``.
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -140,22 +146,122 @@ class DiscreteSAC(Agent):
 
     @staticmethod
     def _action_distribution_from_outputs(outputs: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
-        net_output = outputs.get("net_output", None)
-        if net_output is None:
-            raise RuntimeError("Policy outputs must contain 'net_output' for DiscreteSAC")
+        """Resolve the explicit distribution or logits contract returned by a policy."""
+        probs = outputs.get("probs", None)
+        log_probs = outputs.get("log_probs", None)
+        if (probs is None) != (log_probs is None):
+            raise RuntimeError("Policy outputs must provide both 'probs' and 'log_probs'")
+        if probs is not None:
+            return probs, log_probs
 
-        if torch.all(net_output >= 0):
-            sums = net_output.sum(dim=-1, keepdim=True)
-            if torch.allclose(sums, torch.ones_like(sums), atol=1e-4, rtol=1e-4):
-                probs = torch.clamp(net_output, min=1e-8)
-                log_probs = torch.log(probs)
-                return probs, log_probs
+        logits = outputs.get("logits", outputs.get("net_output", None))
+        if logits is None:
+            raise RuntimeError(
+                "Policy outputs must contain either ('probs', 'log_probs'), 'logits', or logits in 'net_output'"
+            )
 
-        log_probs = F.log_softmax(net_output, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
         return log_probs.exp(), log_probs
 
     def _get_states(self, observations: torch.Tensor, states: torch.Tensor | None) -> torch.Tensor:
         return observations if states is None else states
+
+    @staticmethod
+    def _build_discrete_invalid_mask_from_states(states: Any) -> torch.Tensor | None:
+        """Extract an ARIADNE invalid-position mask while retaining one safe action."""
+        if not isinstance(states, (list, tuple)) or len(states) < 8:
+            return None
+
+        # Supported layouts:
+        # old: [node, pad, orientation, edge, idx, ori_idx, current_edge, edge_pad, ...]
+        # new: [node_base, node_aux, pad, orientation, edge, idx, ori_idx, current_edge, edge_pad, ...]
+        if len(states) >= 9:
+            current_edge = states[7]
+            edge_padding_mask = states[8]
+        else:
+            current_edge = states[6]
+            edge_padding_mask = states[7]
+        node_inputs = states[0]
+
+        if not (torch.is_tensor(current_edge) and torch.is_tensor(edge_padding_mask) and torch.is_tensor(node_inputs)):
+            return None
+        if node_inputs.dim() < 2:
+            return None
+
+        if current_edge.dim() == 2:
+            current_edge = current_edge.unsqueeze(-1)
+        elif current_edge.dim() != 3 or current_edge.shape[-1] != 1:
+            return None
+
+        if edge_padding_mask.dim() == 3 and edge_padding_mask.shape[1] == 1:
+            invalid_mask = edge_padding_mask.squeeze(1)
+        elif edge_padding_mask.dim() == 2:
+            invalid_mask = edge_padding_mask
+        else:
+            return None
+        if invalid_mask.shape[1] == 0:
+            return None
+
+        edge_out_of_range = (current_edge < 0) | (current_edge >= node_inputs.shape[1])
+        edge_out_of_range = edge_out_of_range.squeeze(-1)
+        if invalid_mask.shape != edge_out_of_range.shape:
+            return None
+
+        # Clone so the all-invalid fallback never mutates a replay sample view.
+        invalid_mask = invalid_mask.bool().clone() | edge_out_of_range
+        all_invalid = invalid_mask.all(dim=1)
+        if all_invalid.any():
+            invalid_mask[all_invalid, 0] = False
+        return invalid_mask
+
+    @staticmethod
+    def _sanitize_discrete_action_indices(
+        gather_index: torch.Tensor,
+        invalid_mask: torch.Tensor | None,
+        *,
+        num_actions: int | None = None,
+    ) -> torch.Tensor:
+        """Replace invalid or out-of-range critic indices with the first valid action."""
+        if num_actions is None:
+            if invalid_mask is None:
+                raise ValueError("num_actions is required when no invalid action mask is available")
+            num_actions = invalid_mask.shape[1]
+        if num_actions <= 0:
+            raise ValueError("Discrete critics must expose at least one action")
+
+        if invalid_mask is None:
+            invalid_mask = torch.zeros(
+                (gather_index.shape[0], num_actions), dtype=torch.bool, device=gather_index.device
+            )
+        else:
+            if invalid_mask.dim() != 2 or invalid_mask.shape != (gather_index.shape[0], num_actions):
+                raise ValueError(
+                    f"Invalid action mask shape {tuple(invalid_mask.shape)}; "
+                    f"expected {(gather_index.shape[0], num_actions)}"
+                )
+            invalid_mask = invalid_mask.to(device=gather_index.device, dtype=torch.bool).clone()
+
+        all_invalid = invalid_mask.all(dim=1)
+        if all_invalid.any():
+            invalid_mask[all_invalid, 0] = False
+
+        in_range = (gather_index >= 0) & (gather_index < num_actions)
+        bounded_index = gather_index.clamp(min=0, max=num_actions - 1)
+        chosen_invalid = ~in_range | torch.gather(invalid_mask, 1, bounded_index)
+        first_valid = (~invalid_mask).to(dtype=torch.int64).argmax(dim=1, keepdim=True)
+        return torch.where(chosen_invalid, first_valid, bounded_index)
+
+    def _to_device_recursive(self, value: Any) -> Any:
+        """Move tensors in nested replay values to the configured device."""
+        if torch.is_tensor(value):
+            return value.to(self.device, non_blocking=True)
+        if isinstance(value, list):
+            return [self._to_device_recursive(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._to_device_recursive(item) for item in value)
+        if isinstance(value, dict):
+            return {key: self._to_device_recursive(item) for key, item in value.items()}
+        return value
 
     def init(self, *, trainer_cfg: dict[str, Any] | None = None) -> None:
         super().init(trainer_cfg=trainer_cfg)
@@ -275,6 +381,15 @@ class DiscreteSAC(Agent):
                 sampled_truncated,
             ) = self.memory.sample(names=self._tensors_names, batch_size=self.cfg.batch_size)[0]
 
+            sampled_observations = self._to_device_recursive(sampled_observations)
+            sampled_states = self._to_device_recursive(sampled_states)
+            sampled_actions = self._to_device_recursive(sampled_actions)
+            sampled_rewards = self._to_device_recursive(sampled_rewards)
+            sampled_next_observations = self._to_device_recursive(sampled_next_observations)
+            sampled_next_states = self._to_device_recursive(sampled_next_states)
+            sampled_terminated = self._to_device_recursive(sampled_terminated)
+            sampled_truncated = self._to_device_recursive(sampled_truncated)
+
             with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
                 inputs = {
                     "observations": self._observation_preprocessor(sampled_observations, train=True),
@@ -335,10 +450,17 @@ class DiscreteSAC(Agent):
 
                 critic_1_values, _ = self.critic_1.act(inputs, role="critic_1")
                 critic_2_values, _ = self.critic_2.act(inputs, role="critic_2")
+                if critic_1_values.shape[1] != critic_2_values.shape[1]:
+                    raise ValueError("Discrete critics must expose the same number of actions")
 
                 gather_index = sampled_actions.long()
                 if gather_index.dim() == 1:
                     gather_index = gather_index.unsqueeze(1)
+
+                invalid_mask = self._build_discrete_invalid_mask_from_states(sampled_states)
+                gather_index = self._sanitize_discrete_action_indices(
+                    gather_index, invalid_mask, num_actions=critic_1_values.shape[1]
+                )
 
                 critic_1_values = torch.gather(critic_1_values, 1, gather_index)
                 critic_2_values = torch.gather(critic_2_values, 1, gather_index)
@@ -369,9 +491,7 @@ class DiscreteSAC(Agent):
             if self.cfg.learn_entropy:
                 with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
                     entropy = torch.sum(action_probs * action_log_probs, dim=-1, keepdim=True)
-                    entropy_loss = -(
-                        self.log_entropy_coefficient * (entropy.detach() + self._target_entropy)
-                    ).mean()
+                    entropy_loss = -(self.log_entropy_coefficient * (entropy.detach() + self._target_entropy)).mean()
 
                 self.entropy_optimizer.zero_grad()
                 self.scaler.scale(entropy_loss).backward()
