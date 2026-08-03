@@ -33,11 +33,13 @@ class _SyntheticPolicy(Model):
         self.contract = contract
         self.logits = torch.nn.Parameter(torch.tensor([0.2, -0.1, 0.5]))
         self.register_buffer("invalid_action_mask", invalid_action_mask)
+        self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def compute(self, inputs: dict[str, Any], role: str = "") -> tuple[torch.Tensor, dict[str, Any]]:
         raise NotImplementedError
 
     def act(self, inputs: dict[str, Any], *, role: str = "") -> tuple[torch.Tensor, dict[str, Any]]:
+        self.calls.append((role, inputs))
         logits = self.logits.unsqueeze(0).expand(_batch_size(inputs), -1)
         if self.contract == "distribution":
             outputs = {
@@ -59,11 +61,13 @@ class _SyntheticCritic(Model):
             device="cpu",
         )
         self.q_values = torch.nn.Parameter(torch.tensor([0.3, -0.2, 0.7]))
+        self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def compute(self, inputs: dict[str, Any], role: str = "") -> tuple[torch.Tensor, dict[str, Any]]:
         raise NotImplementedError
 
     def act(self, inputs: dict[str, Any], *, role: str = "") -> tuple[torch.Tensor, dict[str, Any]]:
+        self.calls.append((role, inputs))
         return self.q_values.unsqueeze(0).expand(_batch_size(inputs), -1), {}
 
 
@@ -74,6 +78,30 @@ class _SyntheticReplay:
     def sample(self, names: list[str], *, batch_size: int) -> list[tuple[Any, ...]]:
         assert batch_size == self.sample_value[2].shape[0]
         return [self.sample_value]
+
+
+class _RecordingReplay(_SyntheticReplay):
+    """Minimal replay double that records the public transition payload."""
+
+    def __init__(self, sample: tuple[Any, ...]) -> None:
+        super().__init__(sample)
+        self.transitions: list[dict[str, Any]] = []
+
+    def add_samples(self, **samples: Any) -> None:
+        self.transitions.append(samples)
+
+
+class _OffsetPreprocessor(torch.nn.Module):
+    """Deterministic state preprocessor that preserves checkpoint state."""
+
+    def __init__(self, *, offset: float) -> None:
+        super().__init__()
+        self.register_buffer("offset", torch.tensor(offset))
+        self.calls: list[tuple[Any, bool]] = []
+
+    def forward(self, value: Any, train: bool = False) -> Any:
+        self.calls.append((value, train))
+        return value + self.offset if torch.is_tensor(value) else value
 
 
 def _invalid_action_mask() -> torch.Tensor:
@@ -114,7 +142,17 @@ def _nested_replay_sample() -> tuple[Any, ...]:
     )
 
 
-def _make_agent(contract: str, sample: tuple[Any, ...], invalid_action_mask: torch.Tensor) -> DiscreteSAC:
+def _make_agent(
+    contract: str,
+    sample: tuple[Any, ...],
+    invalid_action_mask: torch.Tensor,
+    *,
+    device: str | torch.device = "cpu",
+    memory: _SyntheticReplay | None = None,
+    learn_entropy: bool = False,
+    state_preprocessor: type[torch.nn.Module] | None = None,
+    random_timesteps: int = 0,
+) -> DiscreteSAC:
     models = {
         "policy": _SyntheticPolicy(contract, invalid_action_mask),
         "critic_1": _SyntheticCritic(),
@@ -124,7 +162,10 @@ def _make_agent(contract: str, sample: tuple[Any, ...], invalid_action_mask: tor
     }
     cfg = DISCRETE_SAC_CFG(
         batch_size=3,
-        learn_entropy=False,
+        learn_entropy=learn_entropy,
+        random_timesteps=random_timesteps,
+        state_preprocessor=state_preprocessor,
+        state_preprocessor_kwargs={"offset": 2.0} if state_preprocessor is not None else {},
         steps_to_target_net_update=64,
         experiment={
             "directory": "",
@@ -135,10 +176,10 @@ def _make_agent(contract: str, sample: tuple[Any, ...], invalid_action_mask: tor
     )
     agent = DiscreteSAC(
         models=models,
-        memory=_SyntheticReplay(sample),
+        memory=_SyntheticReplay(sample) if memory is None else memory,
         observation_space=gymnasium.spaces.Box(low=-1, high=1, shape=(2,)),
         action_space=gymnasium.spaces.Discrete(3),
-        device="cpu",
+        device=device,
         cfg=cfg,
     )
     agent._tensors_names = [
@@ -243,3 +284,133 @@ def test_update_accepts_equivalent_contracts_and_all_invalid_policy_masks() -> N
     # The all-invalid row remains unchanged; the safe fallback exists only in the sanitizer's clone.
     torch.testing.assert_close(distribution_mask[1], torch.tensor([True, True, True]))
     torch.testing.assert_close(logits_mask[1], torch.tensor([True, True, True]))
+
+
+@pytest.mark.parametrize("device", ["cpu"])
+def test_cpu_act_preprocesses_explicit_states_and_random_actions(device: str) -> None:
+    agent = _make_agent(
+        "logits",
+        _nested_replay_sample(),
+        _invalid_action_mask(),
+        device=device,
+        state_preprocessor=_OffsetPreprocessor,
+        random_timesteps=1,
+    )
+    observations = torch.zeros(3, 2, device=device)
+    states = torch.ones(3, 2, device=device)
+
+    random_actions, random_outputs = agent.act(observations, states, timestep=0, timesteps=2)
+    actions, _ = agent.act(observations, states, timestep=1, timesteps=2)
+
+    assert random_actions.shape == (3, 1)
+    assert random_outputs == {}
+    torch.testing.assert_close(actions, torch.full((3, 1), 2, device=device))
+    preprocessor = agent._state_preprocessor
+    assert isinstance(preprocessor, _OffsetPreprocessor)
+    assert preprocessor.calls[-1] == (states, False)
+    policy_inputs = agent.policy.calls[-1][1]
+    torch.testing.assert_close(policy_inputs["states"], states + 2)
+    assert policy_inputs["states"].device.type == device
+
+
+def test_record_transition_uses_explicit_states_and_preserves_nested_payloads() -> None:
+    sample = _nested_replay_sample()
+    memory = _RecordingReplay(sample)
+    agent = _make_agent("logits", sample, _invalid_action_mask(), memory=memory)
+    observations = {"nested": [torch.zeros(3, 2)]}
+    next_observations = {"nested": [torch.ones(3, 2)]}
+
+    agent.record_transition(
+        observations=observations,
+        states=None,
+        actions=torch.tensor([[0.0], [1.0], [2.0]]),
+        rewards=torch.ones(3, 1),
+        next_observations=next_observations,
+        next_states=None,
+        terminated=torch.zeros(3, 1, dtype=torch.bool),
+        truncated=torch.zeros(3, 1, dtype=torch.bool),
+        infos={"external": "ignored"},
+        timestep=0,
+        timesteps=1,
+    )
+
+    assert len(memory.transitions) == 1
+    transition = memory.transitions[0]
+    assert transition["observations"] is observations
+    assert transition["states"] is observations
+    assert transition["next_observations"] is next_observations
+    assert transition["next_states"] is next_observations
+
+
+@pytest.mark.parametrize("device", ["cpu"])
+def test_cpu_update_changes_actor_critics_and_entropy_in_contract_order(device: str) -> None:
+    torch.manual_seed(7)
+    agent = _make_agent("logits", _nested_replay_sample(), _invalid_action_mask(), device=device, learn_entropy=True)
+    before = {
+        name: next(agent.models[name].parameters()).detach().clone()
+        for name in ("policy", "critic_1", "critic_2")
+    }
+    entropy_before = agent._entropy_coefficient
+
+    agent.update(timestep=0, timesteps=1)
+
+    for name, parameter in before.items():
+        assert not torch.equal(parameter, next(agent.models[name].parameters()))
+    assert entropy_before != agent._entropy_coefficient.item()
+    assert [role for role, _ in agent.policy.calls] == ["policy", "policy"]
+    assert [role for role, _ in agent.critic_1.calls] == ["critic_1", "critic_1"]
+    assert [role for role, _ in agent.target_critic_1.calls] == ["target_critic_1"]
+
+
+def test_checkpoint_manifest_round_trips_models_optimizers_entropy_and_preprocessor(tmp_path: Any) -> None:
+    agent = _make_agent(
+        "logits",
+        _nested_replay_sample(),
+        _invalid_action_mask(),
+        learn_entropy=True,
+        state_preprocessor=_OffsetPreprocessor,
+    )
+    agent.update(timestep=0, timesteps=1)
+    path = tmp_path / "discrete-sac.pt"
+    agent.save(path)
+    modules = torch.load(path)
+
+    assert list(modules) == [
+        "policy",
+        "critic_1",
+        "critic_2",
+        "target_critic_1",
+        "target_critic_2",
+        "entropy_optimizer",
+        "policy_optimizer",
+        "critic1_optimizer",
+        "critic2_optimizer",
+        "state_preprocessor",
+    ]
+    saved_policy = modules["policy"]["logits"].clone()
+    with torch.no_grad():
+        agent.policy.logits.add_(5)
+    agent.load(path)
+    torch.testing.assert_close(agent.policy.logits, saved_policy)
+    torch.testing.assert_close(agent._state_preprocessor.offset, torch.tensor(2.0))
+
+
+@pytest.mark.parametrize(
+    ("outputs", "message"),
+    [
+        ({}, "must contain either"),
+        ({"log_probs": torch.tensor([[0.0]])}, "both 'probs' and 'log_probs'"),
+    ],
+)
+def test_invalid_policy_output_contracts_are_rejected(outputs: dict[str, torch.Tensor], message: str) -> None:
+    with pytest.raises(RuntimeError, match=message):
+        DiscreteSAC._action_distribution_from_outputs(outputs)
+
+
+def test_invalid_sanitizer_dimensions_and_action_count_are_rejected() -> None:
+    with pytest.raises(ValueError, match="at least one action"):
+        DiscreteSAC._sanitize_discrete_action_indices(torch.tensor([[0]]), None, num_actions=0)
+    with pytest.raises(ValueError, match="Invalid action mask shape"):
+        DiscreteSAC._sanitize_discrete_action_indices(
+            torch.tensor([[0], [1]]), torch.zeros(2, 2, dtype=torch.bool), num_actions=3
+        )
