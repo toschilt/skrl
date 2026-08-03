@@ -8,14 +8,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).parents[1]
-BASELINE_FILE_COUNT = 530
+BASELINE_FILE_COUNT = 532
 AUDIT_TEST = Path("tests/test_lto69_inventory.py")
 OWNED_ROOTS = ("skrl/", "tests/", "examples/", "docs/source/")
 FORK_DELTA = {
     "skrl/agents/torch/ppo/ppo_rnn.py",
     "skrl/agents/torch/sac/__init__.py",
+    "skrl/agents/torch/sac/_common.py",
+    "skrl/agents/torch/sac/_factorized.py",
     "skrl/agents/torch/sac/discrete_sac.py",
     "skrl/agents/torch/sac/discrete_sac_cfg.py",
     "skrl/agents/torch/sac/discrete_sac_cfg_factorized.py",
@@ -28,6 +29,8 @@ FORK_DELTA = {
     "tests/agents/torch/test_discrete_sac_factorized_simple.py",
 }
 PATHSIM_BOUNDARY = {
+    "skrl/agents/torch/sac/_common.py",
+    "skrl/agents/torch/sac/_factorized.py",
     "skrl/agents/torch/sac/discrete_sac.py",
     "skrl/agents/torch/sac/discrete_sac_cfg.py",
     "skrl/agents/torch/sac/discrete_sac_cfg_factorized.py",
@@ -97,5 +100,5 @@ def test_fork_and_pathsim_sets_are_complete_snapshot_members() -> None:
 
     assert FORK_DELTA <= paths
     assert PATHSIM_BOUNDARY <= FORK_DELTA
-    assert len(FORK_DELTA) == 12
-    assert len(PATHSIM_BOUNDARY) == 6
+    assert len(FORK_DELTA) == 14
+    assert len(PATHSIM_BOUNDARY) == 8

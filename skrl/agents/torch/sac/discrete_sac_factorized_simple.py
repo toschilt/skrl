@@ -10,19 +10,36 @@ from __future__ import annotations
 from typing import Any
 
 import gymnasium
-from packaging import version
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from skrl import config, logger
+from skrl import config
 from skrl.agents.torch import Agent
 from skrl.memories.torch import Memory
 from skrl.models.torch import Model
 from skrl.utils import ScopedTimer
 
 from .discrete_sac_cfg_factorized import FACTORIZED_DISCRETE_SAC_CFG
+from ._common import (
+    broadcast_trainable_sac_models,
+    configure_preprocessors,
+    create_grad_scaler,
+    get_states,
+    initialize_target_critics,
+    move_to_device_recursive,
+    register_sac_models,
+    update_target_critics,
+)
+from ._factorized import (
+    build_position_invalid_mask_from_states,
+    conservative_q_penalty,
+    extract_factorized_policy_outputs,
+    factorized_q_policy_diagnostics,
+    masked_position_distribution,
+    resolve_target_entropies,
+    sanitize_position_actions,
+)
 
 
 class FactorizedDiscreteSACSimple(Agent):
@@ -74,41 +91,18 @@ class FactorizedDiscreteSACSimple(Agent):
             self.curriculum_controller = curriculum_cfg.create(env=env)
             self.curriculum_controller.set_agent(self)
 
-        self.policy = self.models.get("policy", None)
-        self.critic_1 = self.models.get("critic_1", None)
-        self.critic_2 = self.models.get("critic_2", None)
-        self.target_critic_1 = self.models.get("target_critic_1", None)
-        self.target_critic_2 = self.models.get("target_critic_2", None)
-
-        self.checkpoint_modules["policy"] = self.policy
-        self.checkpoint_modules["critic_1"] = self.critic_1
-        self.checkpoint_modules["critic_2"] = self.critic_2
-        self.checkpoint_modules["target_critic_1"] = self.target_critic_1
-        self.checkpoint_modules["target_critic_2"] = self.target_critic_2
-
-        if config.torch.is_distributed:
-            logger.info("Broadcasting models' parameters")
-            if self.policy is not None:
-                self.policy.broadcast_parameters()
-            if self.critic_1 is not None:
-                self.critic_1.broadcast_parameters()
-            if self.critic_2 is not None:
-                self.critic_2.broadcast_parameters()
+        (
+            self.policy,
+            self.critic_1,
+            self.critic_2,
+            self.target_critic_1,
+            self.target_critic_2,
+        ) = register_sac_models(self)
+        broadcast_trainable_sac_models(self.policy, self.critic_1, self.critic_2)
 
         self._device_type = torch.device(self.device).type
-        if version.parse(torch.__version__) >= version.parse("2.4"):
-            self.scaler = torch.amp.GradScaler(
-                device=self._device_type,
-                enabled=self.cfg.mixed_precision,
-            )
-        else:
-            self.scaler = torch.cuda.amp.GradScaler(enabled=self.cfg.mixed_precision)
-
-        if self.target_critic_1 is not None and self.target_critic_2 is not None:
-            self.target_critic_1.freeze_parameters(True)
-            self.target_critic_2.freeze_parameters(True)
-            self.target_critic_1.update_parameters(self.critic_1, polyak=1)
-            self.target_critic_2.update_parameters(self.critic_2, polyak=1)
+        self.scaler = create_grad_scaler(self.device, self.cfg.mixed_precision)
+        initialize_target_critics(self.target_critic_1, self.target_critic_2, self.critic_1, self.critic_2)
 
         self._target_update_counter = 1
         self._gradient_update_counter = 0
@@ -122,26 +116,14 @@ class FactorizedDiscreteSACSimple(Agent):
             self.entropy_coefficients = nn.Module()
             self.entropy_coefficients.register_parameter(
                 "log_position_entropy_coefficient",
-                nn.Parameter(
-                    torch.log(
-                        torch.tensor([self._position_entropy_coefficient], device=self.device)
-                    )
-                ),
+                nn.Parameter(torch.log(torch.tensor([self._position_entropy_coefficient], device=self.device))),
             )
             self.entropy_coefficients.register_parameter(
                 "log_orientation_entropy_coefficient",
-                nn.Parameter(
-                    torch.log(
-                        torch.tensor([self._orientation_entropy_coefficient], device=self.device)
-                    )
-                ),
+                nn.Parameter(torch.log(torch.tensor([self._orientation_entropy_coefficient], device=self.device))),
             )
-            self.log_position_entropy_coefficient = (
-                self.entropy_coefficients.log_position_entropy_coefficient
-            )
-            self.log_orientation_entropy_coefficient = (
-                self.entropy_coefficients.log_orientation_entropy_coefficient
-            )
+            self.log_position_entropy_coefficient = self.entropy_coefficients.log_position_entropy_coefficient
+            self.log_orientation_entropy_coefficient = self.entropy_coefficients.log_orientation_entropy_coefficient
 
             entropy_lr = self.cfg.learning_rate[2]
             self.position_entropy_optimizer = torch.optim.Adam(
@@ -153,9 +135,7 @@ class FactorizedDiscreteSACSimple(Agent):
                 lr=entropy_lr,
             )
             self.checkpoint_modules["position_entropy_optimizer"] = self.position_entropy_optimizer
-            self.checkpoint_modules["orientation_entropy_optimizer"] = (
-                self.orientation_entropy_optimizer
-            )
+            self.checkpoint_modules["orientation_entropy_optimizer"] = self.orientation_entropy_optimizer
             self.checkpoint_modules["entropy_coefficients"] = self.entropy_coefficients
 
         if self.policy is not None and self.critic_1 is not None and self.critic_2 is not None:
@@ -179,12 +159,8 @@ class FactorizedDiscreteSACSimple(Agent):
             self.policy_scheduler = self.cfg.learning_rate_scheduler[0]
             self.critic1_scheduler = self.cfg.learning_rate_scheduler[1]
             self.critic2_scheduler = self.cfg.learning_rate_scheduler[1]
-            self.position_entropy_scheduler = (
-                self.cfg.learning_rate_scheduler[2] if self.cfg.learn_entropy else None
-            )
-            self.orientation_entropy_scheduler = (
-                self.cfg.learning_rate_scheduler[2] if self.cfg.learn_entropy else None
-            )
+            self.position_entropy_scheduler = self.cfg.learning_rate_scheduler[2] if self.cfg.learn_entropy else None
+            self.orientation_entropy_scheduler = self.cfg.learning_rate_scheduler[2] if self.cfg.learn_entropy else None
 
             if self.policy_scheduler is not None:
                 self.policy_scheduler = self.cfg.learning_rate_scheduler[0](
@@ -210,24 +186,10 @@ class FactorizedDiscreteSACSimple(Agent):
                     **self.cfg.learning_rate_scheduler_kwargs[2],
                 )
 
-        if self.cfg.observation_preprocessor:
-            self._observation_preprocessor = self.cfg.observation_preprocessor(
-                **self.cfg.observation_preprocessor_kwargs
-            )
-            self.checkpoint_modules["observation_preprocessor"] = self._observation_preprocessor
-        else:
-            self._observation_preprocessor = self._empty_preprocessor
-
-        if self.cfg.state_preprocessor:
-            self._state_preprocessor = self.cfg.state_preprocessor(
-                **self.cfg.state_preprocessor_kwargs
-            )
-            self.checkpoint_modules["state_preprocessor"] = self._state_preprocessor
-        else:
-            self._state_preprocessor = self._empty_preprocessor
+        configure_preprocessors(self)
 
     def _get_states(self, observations: torch.Tensor, states: torch.Tensor | None) -> torch.Tensor:
-        return observations if states is None else states
+        return get_states(observations, states)
 
     @staticmethod
     def _scalar_value(value) -> float:
@@ -239,25 +201,10 @@ class FactorizedDiscreteSACSimple(Agent):
     def _extract_factorized_policy_outputs(
         outputs: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        logits_pos = outputs.get("logits_pos", None)
-        logits_rot = outputs.get("logits_rot", None)
-        if logits_pos is None or logits_rot is None:
-            raise RuntimeError(
-                "Policy outputs must contain 'logits_pos' [B, N_pos] and "
-                "'logits_rot' [B, N_pos, N_rot]"
-            )
-        return logits_pos, logits_rot
+        return extract_factorized_policy_outputs(outputs)
 
     def _to_device_recursive(self, value):
-        if torch.is_tensor(value):
-            return value.to(self.device, non_blocking=True)
-        if isinstance(value, list):
-            return [self._to_device_recursive(v) for v in value]
-        if isinstance(value, tuple):
-            return tuple(self._to_device_recursive(v) for v in value)
-        if isinstance(value, dict):
-            return {k: self._to_device_recursive(v) for k, v in value.items()}
-        return value
+        return move_to_device_recursive(value, self.device)
 
     def _filter_transition_batch(self, value, mask: torch.Tensor):
         """Select valid env rows from a tensor/list/dict transition payload."""
@@ -277,10 +224,7 @@ class FactorizedDiscreteSACSimple(Agent):
         return value
 
     def _curriculum_replay_enabled(self) -> bool:
-        return (
-            bool(getattr(self.cfg, "curriculum_replay_enabled", False))
-            and self.curriculum_controller is not None
-        )
+        return bool(getattr(self.cfg, "curriculum_replay_enabled", False)) and self.curriculum_controller is not None
 
     def _create_curriculum_replay_tensors(self) -> None:
         if self.memory is None or not hasattr(self.memory, "create_tensor"):
@@ -461,21 +405,36 @@ class FactorizedDiscreteSACSimple(Agent):
 
     def _curriculum_replay_quotas(self, batch_size: int) -> tuple[int, int, int]:
         if self._is_final_reward_phase():
-            current_fraction = max(0.0, float(getattr(
-                self.cfg,
-                "curriculum_replay_final_phase_current_fraction",
-                getattr(self.cfg, "curriculum_replay_current_fraction", 0.70),
-            )))
-            adjacent_fraction = max(0.0, float(getattr(
-                self.cfg,
-                "curriculum_replay_final_phase_adjacent_fraction",
-                getattr(self.cfg, "curriculum_replay_adjacent_fraction", 0.20),
-            )))
-            uniform_fraction = max(0.0, float(getattr(
-                self.cfg,
-                "curriculum_replay_final_phase_uniform_fraction",
-                getattr(self.cfg, "curriculum_replay_uniform_fraction", 0.10),
-            )))
+            current_fraction = max(
+                0.0,
+                float(
+                    getattr(
+                        self.cfg,
+                        "curriculum_replay_final_phase_current_fraction",
+                        getattr(self.cfg, "curriculum_replay_current_fraction", 0.70),
+                    )
+                ),
+            )
+            adjacent_fraction = max(
+                0.0,
+                float(
+                    getattr(
+                        self.cfg,
+                        "curriculum_replay_final_phase_adjacent_fraction",
+                        getattr(self.cfg, "curriculum_replay_adjacent_fraction", 0.20),
+                    )
+                ),
+            )
+            uniform_fraction = max(
+                0.0,
+                float(
+                    getattr(
+                        self.cfg,
+                        "curriculum_replay_final_phase_uniform_fraction",
+                        getattr(self.cfg, "curriculum_replay_uniform_fraction", 0.10),
+                    )
+                ),
+            )
         else:
             current_fraction = max(0.0, float(getattr(self.cfg, "curriculum_replay_current_fraction", 0.70)))
             adjacent_fraction = max(0.0, float(getattr(self.cfg, "curriculum_replay_adjacent_fraction", 0.20)))
@@ -617,8 +576,7 @@ class FactorizedDiscreteSACSimple(Agent):
         sampled = self.memory.sample_by_index(names=sample_names, indexes=indexes)[0]
         sampled_batch = sampled[: len(self._tensors_names)]
         sampled_metadata = {
-            name: sampled[len(self._tensors_names) + i]
-            for i, name in enumerate(self.CURRICULUM_REPLAY_TENSOR_NAMES)
+            name: sampled[len(self._tensors_names) + i] for i, name in enumerate(self.CURRICULUM_REPLAY_TENSOR_NAMES)
         }
         if include_reward_components:
             reward_components = sampled[len(self._tensors_names) + len(self.CURRICULUM_REPLAY_TENSOR_NAMES)]
@@ -629,80 +587,27 @@ class FactorizedDiscreteSACSimple(Agent):
         return sampled_batch
 
     def _resolve_target_entropies(self, n_pos: int, n_rot: int) -> None:
-        if self._target_position_entropy is None:
-            self._target_position_entropy = float(torch.log(torch.tensor(float(n_pos))))
-        if self._target_orientation_entropy is None:
-            self._target_orientation_entropy = float(torch.log(torch.tensor(float(n_rot))))
+        self._target_position_entropy, self._target_orientation_entropy = resolve_target_entropies(
+            self._target_position_entropy, self._target_orientation_entropy, n_pos, n_rot
+        )
 
     @staticmethod
     def _build_position_invalid_mask_from_states(states: Any) -> torch.Tensor:
-        current_index = states[4]
-        current_neighbors = states[6]
-        edge_padding_mask = states[7]
-
-        if current_neighbors.dim() == 2:
-            current_neighbors = current_neighbors.unsqueeze(-1).long()
-        elif current_neighbors.dim() == 3:
-            current_neighbors = current_neighbors.long()
-        else:
-            raise ValueError(
-                f"current_neighbors must have dim 2 or 3, got {current_neighbors.dim()}"
-            )
-
-        if current_index.dim() == 3:
-            current_node_idx = current_index.squeeze(-1).squeeze(-1).long()
-        elif current_index.dim() == 2:
-            current_node_idx = current_index.squeeze(-1).long()
-        else:
-            current_node_idx = current_index.long()
-
-        if edge_padding_mask.dim() == 3:
-            invalid_mask = edge_padding_mask.squeeze(1).bool()
-        else:
-            invalid_mask = edge_padding_mask.bool()
-
-        self_mask = current_neighbors.squeeze(-1) == current_node_idx.view(-1, 1)
-        return invalid_mask | self_mask
+        return build_position_invalid_mask_from_states(states)
 
     @staticmethod
     def _masked_position_distribution(
         logits_pos: torch.Tensor,
         invalid_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        masked_logits = logits_pos.masked_fill(invalid_mask, -1e9)
-        pos_probs = torch.softmax(masked_logits, dim=-1)
-        pos_probs = pos_probs * (~invalid_mask).float()
-
-        probs_sum = pos_probs.sum(dim=-1, keepdim=True)
-        normalized_probs = pos_probs / probs_sum.clamp_min(1e-12)
-
-        has_valid = (~invalid_mask).any(dim=-1, keepdim=True)
-        fallback = torch.zeros_like(normalized_probs)
-        fallback[:, 0] = 1.0
-        normalized_probs = torch.where(has_valid, normalized_probs, fallback)
-
-        log_probs = torch.log(normalized_probs.clamp_min(1e-8))
-        return log_probs, normalized_probs
+        return masked_position_distribution(logits_pos, invalid_mask)
 
     @staticmethod
     def _sanitize_position_actions(
         position_actions: torch.Tensor,
         invalid_mask: torch.Tensor,
     ) -> torch.Tensor:
-        position_actions = (
-            position_actions.view(-1)
-            .long()
-            .clamp(min=0, max=invalid_mask.shape[1] - 1)
-        )
-
-        valid_mask = ~invalid_mask
-        first_valid = valid_mask.float().argmax(dim=1).long()
-        has_valid = valid_mask.any(dim=1)
-        replacement = torch.where(has_valid, first_valid, torch.zeros_like(first_valid))
-
-        batch_index = torch.arange(position_actions.shape[0], device=position_actions.device)
-        chosen_invalid = invalid_mask[batch_index, position_actions]
-        return torch.where(chosen_invalid, replacement, position_actions)
+        return sanitize_position_actions(position_actions, invalid_mask)
 
     @staticmethod
     def _conservative_q_penalty(
@@ -713,20 +618,7 @@ class FactorizedDiscreteSACSimple(Agent):
         invalid_action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """CQL-style logsumexp penalty over all valid factorized actions."""
-        temperature = max(float(temperature), 1e-6)
-        invalid_position_action_mask = invalid_position_mask.unsqueeze(-1).expand_as(q_all)
-        if invalid_action_mask is None:
-            invalid_action_mask = invalid_position_action_mask
-        else:
-            invalid_action_mask = invalid_action_mask.bool() | invalid_position_action_mask
-        masked_q_all = q_all.masked_fill(invalid_action_mask, -1e9)
-        action_logits = masked_q_all.reshape(masked_q_all.shape[0], -1) / temperature
-        conservative_value = temperature * torch.logsumexp(
-            action_logits,
-            dim=1,
-            keepdim=True,
-        )
-        return (conservative_value - q_taken).mean()
+        return conservative_q_penalty(q_all, q_taken, invalid_position_mask, temperature, invalid_action_mask)
 
     def _critic_loss_for_taken_actions(
         self,
@@ -752,12 +644,8 @@ class FactorizedDiscreteSACSimple(Agent):
 
         if conservative_q_scale > 0.0:
             current_orientation_invalid_mask = logits_rot_all.detach() <= -1e8
-            current_action_invalid_mask = (
-                current_invalid_mask.unsqueeze(-1) | current_orientation_invalid_mask
-            )
-            conservative_q_temperature = float(
-                getattr(self.cfg, "conservative_q_temperature", 1.0)
-            )
+            current_action_invalid_mask = current_invalid_mask.unsqueeze(-1) | current_orientation_invalid_mask
+            conservative_q_temperature = float(getattr(self.cfg, "conservative_q_temperature", 1.0))
             critic_all, _ = critic.act(
                 {**inputs, "all_position_actions": True},
                 role="critic",
@@ -782,53 +670,9 @@ class FactorizedDiscreteSACSimple(Agent):
         invalid_orientation_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Summarize how all-action Q compares with policy-weighted Q."""
-        q_all = q_all.detach()
-        position_probs = position_probs.detach()
-        orientation_probs = orientation_probs.detach()
-        invalid_action_mask = invalid_position_mask.detach().bool().unsqueeze(-1)
-        invalid_action_mask = invalid_action_mask.expand_as(q_all)
-        if invalid_orientation_mask is not None:
-            invalid_action_mask = invalid_action_mask | invalid_orientation_mask.detach().bool()
-
-        masked_q_all = q_all.masked_fill(invalid_action_mask, -1e9)
-        flat_q = masked_q_all.reshape(masked_q_all.shape[0], -1)
-        q_max_per_sample, flat_argmax = torch.max(flat_q, dim=1)
-
-        orientation_dim = int(q_all.shape[-1])
-        q_max_position = flat_argmax // orientation_dim
-        q_max_orientation = flat_argmax % orientation_dim
-
-        action_probs = position_probs.unsqueeze(-1) * orientation_probs
-        action_probs = action_probs.masked_fill(invalid_action_mask, 0.0)
-        action_probs = action_probs / action_probs.sum(
-            dim=(1, 2),
-            keepdim=True,
-        ).clamp_min(1e-12)
-
-        valid_q_for_expectation = q_all.masked_fill(invalid_action_mask, 0.0)
-        q_policy_expectation = torch.sum(action_probs * valid_q_for_expectation, dim=(1, 2))
-        q_max_action_probability = torch.gather(
-            action_probs.reshape(action_probs.shape[0], -1),
-            1,
-            flat_argmax.view(-1, 1),
-        ).squeeze(1)
-
-        return {
-            "q_all_max": q_max_per_sample.max(),
-            "q_all_mean": masked_q_all[~invalid_action_mask].mean(),
-            "q_policy_expectation_mean": q_policy_expectation.mean(),
-            "q_policy_expectation_max": q_policy_expectation.max(),
-            "q_max_minus_policy_expectation_mean": (
-                q_max_per_sample - q_policy_expectation
-            ).mean(),
-            "q_max_minus_policy_expectation_max": (
-                q_max_per_sample - q_policy_expectation
-            ).max(),
-            "q_max_action_position_mean": q_max_position.float().mean(),
-            "q_max_action_orientation_mean": q_max_orientation.float().mean(),
-            "q_max_action_probability_mean": q_max_action_probability.mean(),
-            "q_max_action_probability_max": q_max_action_probability.max(),
-        }
+        return factorized_q_policy_diagnostics(
+            q_all, position_probs, orientation_probs, invalid_position_mask, invalid_orientation_mask
+        )
 
     @staticmethod
     def _privileged_observation_stats(observations) -> dict[str, torch.Tensor]:
@@ -996,16 +840,12 @@ class FactorizedDiscreteSACSimple(Agent):
                         f"Reward/env_components/{reward_name}_mean",
                         float(reward_values.float().mean().item()),
                     )
-            terminal_reward_name = str(
-                getattr(self.cfg, "terminal_reward_diagnostic_name", "")
-            )
+            terminal_reward_name = str(getattr(self.cfg, "terminal_reward_diagnostic_name", ""))
             if terminal_reward_name:
                 terminal_reward = sep_reward.get(terminal_reward_name, None)
                 if torch.is_tensor(terminal_reward):
                     terminal_reward = terminal_reward.detach().float().view(-1)
-                    terminal_threshold = float(
-                        getattr(self.cfg, "terminal_reward_diagnostic_threshold", 0.0)
-                    )
+                    terminal_threshold = float(getattr(self.cfg, "terminal_reward_diagnostic_threshold", 0.0))
                     terminal_reward_positive = terminal_reward > terminal_threshold
                     terminated_flat = terminated.detach().bool().view(-1)
                     truncated_flat = truncated.detach().bool().view(-1)
@@ -1018,7 +858,9 @@ class FactorizedDiscreteSACSimple(Agent):
                     )
                     self.track_data(
                         "TerminalSignal/env_terminal_reward_terminated_fraction",
-                        float((terminal_reward_positive & terminated_flat).float().sum().item() / positive_count.item()),
+                        float(
+                            (terminal_reward_positive & terminated_flat).float().sum().item() / positive_count.item()
+                        ),
                     )
                     self.track_data(
                         "TerminalSignal/env_terminal_reward_truncated_fraction",
@@ -1086,8 +928,7 @@ class FactorizedDiscreteSACSimple(Agent):
         curriculum_metadata = self._curriculum_replay_metadata(device=rewards.device)
         if bool(getattr(self.cfg, "skip_previous_done_transitions", False)):
             curriculum_metadata = {
-                key: self._filter_transition_batch(value, store_mask)
-                for key, value in curriculum_metadata.items()
+                key: self._filter_transition_batch(value, store_mask) for key, value in curriculum_metadata.items()
             }
         transition_tensors.update(curriculum_metadata)
         reward_components = self._curriculum_reward_components(
@@ -1164,10 +1005,7 @@ class FactorizedDiscreteSACSimple(Agent):
             self._gradient_update_counter += 1
             actor_update_delay = max(1, int(getattr(self.cfg, "actor_update_delay", 1)))
             actor_learning_enabled = current_timestep >= actor_learning_starts
-            update_actor = (
-                actor_learning_enabled
-                and (self._gradient_update_counter % actor_update_delay) == 0
-            )
+            update_actor = actor_learning_enabled and (self._gradient_update_counter % actor_update_delay) == 0
 
             (
                 sampled_observations,
@@ -1188,9 +1026,7 @@ class FactorizedDiscreteSACSimple(Agent):
             sampled_next_states = self._to_device_recursive(sampled_next_states)
             sampled_terminated = self._to_device_recursive(sampled_terminated)
             sampled_truncated = self._to_device_recursive(sampled_truncated)
-            privileged_observation_stats = self._privileged_observation_stats(
-                sampled_observations
-            )
+            privileged_observation_stats = self._privileged_observation_stats(sampled_observations)
 
             current_invalid_mask = self._build_position_invalid_mask_from_states(sampled_states)
             next_invalid_mask = self._build_position_invalid_mask_from_states(sampled_next_states)
@@ -1262,9 +1098,7 @@ class FactorizedDiscreteSACSimple(Agent):
                         )
 
                     policy_terms = (
-                        q_all
-                        - alpha_position * pos_log_probs.unsqueeze(-1)
-                        - alpha_orientation * rot_log_probs_all
+                        q_all - alpha_position * pos_log_probs.unsqueeze(-1) - alpha_orientation * rot_log_probs_all
                     )
                     inner_expectation = torch.sum(rot_probs_all * policy_terms, dim=-1)
                     policy_objective = torch.sum(pos_probs * inner_expectation, dim=-1)
@@ -1306,9 +1140,7 @@ class FactorizedDiscreteSACSimple(Agent):
             with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
                 with torch.no_grad():
                     _, next_outputs = self.policy.act(next_inputs, role="policy")
-                    next_logits_pos, next_logits_rot_all = self._extract_factorized_policy_outputs(
-                        next_outputs
-                    )
+                    next_logits_pos, next_logits_rot_all = self._extract_factorized_policy_outputs(next_outputs)
                     next_pos_log_probs, next_pos_probs = self._masked_position_distribution(
                         next_logits_pos,
                         next_invalid_mask,
@@ -1350,28 +1182,16 @@ class FactorizedDiscreteSACSimple(Agent):
 
                     target_done_mask = sampled_terminated | sampled_truncated
                     target_nonterminal_mask = target_done_mask.logical_not()
-                    target_bootstrap_values = (
-                        self.cfg.discount_factor
-                        * target_nonterminal_mask
-                        * target_q_values
-                    )
-                    target_values = (
-                        sampled_rewards
-                        + target_bootstrap_values
-                    ).detach()
+                    target_bootstrap_values = self.cfg.discount_factor * target_nonterminal_mask * target_q_values
+                    target_values = (sampled_rewards + target_bootstrap_values).detach()
 
                 if sampled_actions.dim() == 1:
-                    raise RuntimeError(
-                        "Expected factorized actions [B, 2], got flat actions [B]."
-                    )
+                    raise RuntimeError("Expected factorized actions [B, 2], got flat actions [B].")
 
                 position_actions = sampled_actions[:, 0].long()
                 rotation_actions = sampled_actions[:, 1].long()
                 raw_position_actions = position_actions.view(-1)
-                out_of_range = (
-                    (raw_position_actions < 0)
-                    | (raw_position_actions >= current_invalid_mask.shape[1])
-                )
+                out_of_range = (raw_position_actions < 0) | (raw_position_actions >= current_invalid_mask.shape[1])
                 clamped_position_actions = raw_position_actions.clamp(
                     min=0,
                     max=current_invalid_mask.shape[1] - 1,
@@ -1381,12 +1201,9 @@ class FactorizedDiscreteSACSimple(Agent):
                     device=clamped_position_actions.device,
                 )
                 sampled_invalid_position_actions = (
-                    out_of_range
-                    | current_invalid_mask[batch_index, clamped_position_actions]
+                    out_of_range | current_invalid_mask[batch_index, clamped_position_actions]
                 )
-                invalid_replay_action_fraction = (
-                    sampled_invalid_position_actions.float().mean()
-                )
+                invalid_replay_action_fraction = sampled_invalid_position_actions.float().mean()
                 self.track_data(
                     "Replay/invalid_sampled_position_action_fraction",
                     invalid_replay_action_fraction.item(),
@@ -1396,10 +1213,7 @@ class FactorizedDiscreteSACSimple(Agent):
                     "invalid_replay_action_fail_threshold",
                     None,
                 )
-                if (
-                    fail_threshold is not None
-                    and invalid_replay_action_fraction.item() > float(fail_threshold)
-                ):
+                if fail_threshold is not None and invalid_replay_action_fraction.item() > float(fail_threshold):
                     raise RuntimeError(
                         "Replay sampled invalid position actions: "
                         f"fraction={invalid_replay_action_fraction.item():.6f}, "
@@ -1410,12 +1224,8 @@ class FactorizedDiscreteSACSimple(Agent):
                     current_invalid_mask,
                 )
 
-                conservative_q_scale = float(
-                    getattr(self.cfg, "conservative_q_regularization_scale", 0.0)
-                )
-                sequential_critic_update = bool(
-                    getattr(self.cfg, "sequential_critic_update", False)
-                )
+                conservative_q_scale = float(getattr(self.cfg, "conservative_q_regularization_scale", 0.0))
+                sequential_critic_update = bool(getattr(self.cfg, "sequential_critic_update", False))
 
                 if sequential_critic_update:
                     (
@@ -1581,20 +1391,12 @@ class FactorizedDiscreteSACSimple(Agent):
                 self.scaler.step(self.position_entropy_optimizer)
                 self.scaler.step(self.orientation_entropy_optimizer)
 
-                self._position_entropy_coefficient = torch.exp(
-                    self.log_position_entropy_coefficient.detach()
-                )
-                self._orientation_entropy_coefficient = torch.exp(
-                    self.log_orientation_entropy_coefficient.detach()
-                )
+                self._position_entropy_coefficient = torch.exp(self.log_position_entropy_coefficient.detach())
+                self._orientation_entropy_coefficient = torch.exp(self.log_orientation_entropy_coefficient.detach())
 
             self.scaler.update()
 
-            self._target_update_counter += 1
-            if self._target_update_counter > self.cfg.steps_to_target_net_update:
-                self.target_critic_1.update_parameters(self.critic_1, polyak=self.cfg.polyak)
-                self.target_critic_2.update_parameters(self.critic_2, polyak=self.cfg.polyak)
-                self._target_update_counter = 1
+            update_target_critics(self)
 
             if self.policy_scheduler:
                 if update_actor:
@@ -1670,9 +1472,7 @@ class FactorizedDiscreteSACSimple(Agent):
                     "TargetDiagnostics/nonterminal_fraction",
                     target_nonterminal_mask.float().mean().item(),
                 )
-                terminal_threshold = float(
-                    getattr(self.cfg, "terminal_reward_diagnostic_threshold", 0.0)
-                )
+                terminal_threshold = float(getattr(self.cfg, "terminal_reward_diagnostic_threshold", 0.0))
                 if terminal_threshold > 0.0:
                     high_reward_mask = sampled_rewards > terminal_threshold
                     high_reward_fraction = high_reward_mask.float().mean()
@@ -1682,15 +1482,10 @@ class FactorizedDiscreteSACSimple(Agent):
                     )
                     if high_reward_mask.any():
                         high_reward_count = high_reward_mask.float().sum().clamp_min(1.0)
-                        high_reward_nonterminal = (
-                            high_reward_mask & target_nonterminal_mask
-                        )
+                        high_reward_nonterminal = high_reward_mask & target_nonterminal_mask
                         self.track_data(
                             "TargetDiagnostics/high_reward_nonterminal_fraction",
-                            (
-                                high_reward_nonterminal.float().sum()
-                                / high_reward_count
-                            ).item(),
+                            (high_reward_nonterminal.float().sum() / high_reward_count).item(),
                         )
                         self.track_data(
                             "TargetDiagnostics/high_reward_bootstrap_max",
@@ -1756,15 +1551,23 @@ class FactorizedDiscreteSACSimple(Agent):
                 )
                 self.track_data(
                     "Entropy/position_policy_entropy_fraction_of_max",
-                    (position_policy_entropy.mean() / max(self._target_position_entropy, 1e-8)).item()
-                    if torch.is_tensor(position_policy_entropy.mean() / max(self._target_position_entropy, 1e-8))
-                    else float(position_policy_entropy.mean().item() / max(self._target_position_entropy, 1e-8)),
+                    (
+                        (position_policy_entropy.mean() / max(self._target_position_entropy, 1e-8)).item()
+                        if torch.is_tensor(position_policy_entropy.mean() / max(self._target_position_entropy, 1e-8))
+                        else float(position_policy_entropy.mean().item() / max(self._target_position_entropy, 1e-8))
+                    ),
                 )
                 self.track_data(
                     "Entropy/orientation_policy_entropy_fraction_of_max",
-                    (orientation_policy_entropy.mean() / max(self._target_orientation_entropy, 1e-8)).item()
-                    if torch.is_tensor(orientation_policy_entropy.mean() / max(self._target_orientation_entropy, 1e-8))
-                    else float(orientation_policy_entropy.mean().item() / max(self._target_orientation_entropy, 1e-8)),
+                    (
+                        (orientation_policy_entropy.mean() / max(self._target_orientation_entropy, 1e-8)).item()
+                        if torch.is_tensor(
+                            orientation_policy_entropy.mean() / max(self._target_orientation_entropy, 1e-8)
+                        )
+                        else float(
+                            orientation_policy_entropy.mean().item() / max(self._target_orientation_entropy, 1e-8)
+                        )
+                    ),
                 )
                 self.track_data(
                     "Entropy/position_target",
