@@ -4,7 +4,7 @@
 
 This is the ownership and compatibility snapshot for `origin/develop` at
 `cf946bc36205f56fa61c6b30f71ff03f8097cb64` (the LTO-27 and LTO-28 merge
-base).  The snapshot contains **530 Python files**: 279 library modules, 99
+base). The current tracked surface contains **532 Python files**: 281 library modules, 99
 test modules, 132 runnable examples, and 20 documentation snippets.  The
 source-derived guard in `tests/test_lto69_inventory.py` covers every file in
 that snapshot; it deliberately excludes itself, because it is audit metadata
@@ -23,7 +23,7 @@ an optional simulator dependency is installed.
 
 | Paths | Count | Contract owner | Upstream status | Device classification |
 | --- | ---: | --- | --- | --- |
-| `skrl/**` | 279 | skrl library API; `__init__.py` and `base.py` are abstract/import contracts | Upstream-compatible except the fork manifest below | CPU-capable; Isaac-family adapters are GPU-required at runtime |
+| `skrl/**` | 281 | skrl library API; `__init__.py` and `base.py` are abstract/import contracts | Upstream-compatible except the fork manifest below | CPU-capable; Isaac-family adapters are GPU-required at runtime |
 | `tests/**` | 99 | Test contract for the matching library API; package initializers are abstract | Upstream-compatible except the two fork contract suites | CPU-capable; Isaac-family wrapper tests require their external GPU simulator |
 | `examples/**` | 132 | Runnable consumer examples | Upstream-compatible | CPU-capable unless the path names Isaac Gym/Lab or its documented simulator dependency |
 | `docs/source/**` | 20 | Documentation configuration and executable/snippet contract | Upstream-compatible | CPU-capable documentation surface |
@@ -36,18 +36,20 @@ rg --files -g '*.py' | sort
 
 `tests/test_lto69_inventory.py` enforces the four ownership roots, identifies
 abstract module contracts, applies the simulator device exception, and asserts
-the pre-audit 530-file baseline. This makes additions fail review until their
+the tracked 532-file baseline. This makes additions fail review until their
 owner/category is explicitly covered by a prefix rule or the audit is updated.
 
 ## Fork delta from upstream-compatible skrl
 
 `5a078cff1a611d51eb2164101cdd6fa84e3eec2d` is the common ancestor of this
 fork and `Toni-SM/skrl` `develop` at audit time. The focused fork delta is the
-following 12 files (10 production/import surfaces and two CPU contract suites):
+following 14 files (12 production/import surfaces and two CPU contract suites):
 
 ```text
 skrl/agents/torch/ppo/ppo_rnn.py
 skrl/agents/torch/sac/__init__.py
+skrl/agents/torch/sac/_common.py
+skrl/agents/torch/sac/_factorized.py
 skrl/agents/torch/sac/discrete_sac.py
 skrl/agents/torch/sac/discrete_sac_cfg.py
 skrl/agents/torch/sac/discrete_sac_cfg_factorized.py
@@ -68,16 +70,17 @@ mislabel unrelated upstream evolution as a PathSim fork change.
 ## PathSim compatibility boundary
 
 There are **no `PathSim` imports in this repository**. The compatibility delta
-is therefore an API/data-contract boundary, not a source dependency. The six
-direct boundary modules are `discrete_sac.py`, `discrete_sac_cfg.py`,
-`discrete_sac_cfg_factorized.py`, `discrete_sac_factorized_simple.py`,
-`replay.py`, and `rollout.py`; two package barrels expose imports, and
+is therefore an API/data-contract boundary, not a source dependency. The eight
+direct boundary modules are `_common.py`, `_factorized.py`, `discrete_sac.py`,
+`discrete_sac_cfg.py`, `discrete_sac_cfg_factorized.py`,
+`discrete_sac_factorized_simple.py`, `replay.py`, and `rollout.py`; two package barrels expose imports, and
 `ppo_rnn.py` plus `trainers/torch/base.py` are integration adaptations.
 
 ```text
 PathSim consumer configuration (external; no import edge in skrl)
     -> Torch discrete / factorized action, state, done, and info payloads
     -> DiscreteSAC or FactorizedDiscreteSACSimple
+    -> internal SAC setup and factorized-math helpers
     -> ReplayBuffer (off-policy) or RolloutBuffer (sequence/PPO_RNN)
     -> skrl Model / Agent / Trainer public contracts
 ```
@@ -130,10 +133,11 @@ Isaac-family wrappers, training runs, and all GPU commands.
 
 ## Documentation coverage and exceptions
 
-This audit document and its Python ownership check are newly authored. The
-Python check begins with `Purpose:` and `Usage:` as required. No generated code
-or comment-free-code exception was created; existing fork files are observed,
-not modified.
+The LTO-72 helper modules and modified SAC implementations begin with
+`Purpose:` and `Usage:` documentation; the existing inventory test already
+does too. This Markdown audit is documentation rather than executable code, so
+it is not a header exception. No generated or comment-free code exception was
+created.
 
 ## Known limits
 

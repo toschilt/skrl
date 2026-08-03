@@ -10,20 +10,30 @@ from typing import Any
 
 import itertools
 import gymnasium
-from packaging import version
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from skrl import config, logger
+from skrl import config
 from skrl.agents.torch import Agent
 from skrl.memories.torch import Memory
 from skrl.models.torch import Model
 from skrl.utils import ScopedTimer
 
 from .discrete_sac_cfg import DISCRETE_SAC_CFG
+from ._common import (
+    action_distribution_from_outputs,
+    broadcast_trainable_sac_models,
+    configure_preprocessors,
+    create_grad_scaler,
+    get_states,
+    initialize_target_critics,
+    move_to_device_recursive,
+    register_sac_models,
+    sanitize_discrete_action_indices,
+    update_target_critics,
+)
 
 
 class DiscreteSAC(Agent):
@@ -50,38 +60,18 @@ class DiscreteSAC(Agent):
             cfg=DISCRETE_SAC_CFG() if cfg is None else cfg,
         )
 
-        self.policy = self.models.get("policy", None)
-        self.critic_1 = self.models.get("critic_1", None)
-        self.critic_2 = self.models.get("critic_2", None)
-        self.target_critic_1 = self.models.get("target_critic_1", None)
-        self.target_critic_2 = self.models.get("target_critic_2", None)
-
-        self.checkpoint_modules["policy"] = self.policy
-        self.checkpoint_modules["critic_1"] = self.critic_1
-        self.checkpoint_modules["critic_2"] = self.critic_2
-        self.checkpoint_modules["target_critic_1"] = self.target_critic_1
-        self.checkpoint_modules["target_critic_2"] = self.target_critic_2
-
-        if config.torch.is_distributed:
-            logger.info(f"Broadcasting models' parameters")
-            if self.policy is not None:
-                self.policy.broadcast_parameters()
-            if self.critic_1 is not None:
-                self.critic_1.broadcast_parameters()
-            if self.critic_2 is not None:
-                self.critic_2.broadcast_parameters()
+        (
+            self.policy,
+            self.critic_1,
+            self.critic_2,
+            self.target_critic_1,
+            self.target_critic_2,
+        ) = register_sac_models(self)
+        broadcast_trainable_sac_models(self.policy, self.critic_1, self.critic_2)
 
         self._device_type = torch.device(self.device).type
-        if version.parse(torch.__version__) >= version.parse("2.4"):
-            self.scaler = torch.amp.GradScaler(device=self._device_type, enabled=self.cfg.mixed_precision)
-        else:
-            self.scaler = torch.cuda.amp.GradScaler(enabled=self.cfg.mixed_precision)
-
-        if self.target_critic_1 is not None and self.target_critic_2 is not None:
-            self.target_critic_1.freeze_parameters(True)
-            self.target_critic_2.freeze_parameters(True)
-            self.target_critic_1.update_parameters(self.critic_1, polyak=1)
-            self.target_critic_2.update_parameters(self.critic_2, polyak=1)
+        self.scaler = create_grad_scaler(self.device, self.cfg.mixed_precision)
+        initialize_target_critics(self.target_critic_1, self.target_critic_2, self.critic_1, self.critic_2)
 
         self._target_update_counter = 1
 
@@ -130,41 +120,15 @@ class DiscreteSAC(Agent):
                     self.entropy_optimizer, **self.cfg.learning_rate_scheduler_kwargs[2]
                 )
 
-        if self.cfg.observation_preprocessor:
-            self._observation_preprocessor = self.cfg.observation_preprocessor(
-                **self.cfg.observation_preprocessor_kwargs
-            )
-            self.checkpoint_modules["observation_preprocessor"] = self._observation_preprocessor
-        else:
-            self._observation_preprocessor = self._empty_preprocessor
-
-        if self.cfg.state_preprocessor:
-            self._state_preprocessor = self.cfg.state_preprocessor(**self.cfg.state_preprocessor_kwargs)
-            self.checkpoint_modules["state_preprocessor"] = self._state_preprocessor
-        else:
-            self._state_preprocessor = self._empty_preprocessor
+        configure_preprocessors(self)
 
     @staticmethod
     def _action_distribution_from_outputs(outputs: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
         """Resolve the explicit distribution or logits contract returned by a policy."""
-        probs = outputs.get("probs", None)
-        log_probs = outputs.get("log_probs", None)
-        if (probs is None) != (log_probs is None):
-            raise RuntimeError("Policy outputs must provide both 'probs' and 'log_probs'")
-        if probs is not None:
-            return probs, log_probs
-
-        logits = outputs.get("logits", outputs.get("net_output", None))
-        if logits is None:
-            raise RuntimeError(
-                "Policy outputs must contain either ('probs', 'log_probs'), 'logits', or logits in 'net_output'"
-            )
-
-        log_probs = F.log_softmax(logits, dim=-1)
-        return log_probs.exp(), log_probs
+        return action_distribution_from_outputs(outputs)
 
     def _get_states(self, observations: torch.Tensor, states: torch.Tensor | None) -> torch.Tensor:
-        return observations if states is None else states
+        return get_states(observations, states)
 
     @staticmethod
     def _sanitize_discrete_action_indices(
@@ -174,46 +138,11 @@ class DiscreteSAC(Agent):
         num_actions: int | None = None,
     ) -> torch.Tensor:
         """Replace invalid or out-of-range critic indices with the first valid action."""
-        if num_actions is None:
-            if invalid_mask is None:
-                raise ValueError("num_actions is required when no invalid action mask is available")
-            num_actions = invalid_mask.shape[1]
-        if num_actions <= 0:
-            raise ValueError("Discrete critics must expose at least one action")
-
-        if invalid_mask is None:
-            invalid_mask = torch.zeros(
-                (gather_index.shape[0], num_actions), dtype=torch.bool, device=gather_index.device
-            )
-        else:
-            if invalid_mask.dim() != 2 or invalid_mask.shape != (gather_index.shape[0], num_actions):
-                raise ValueError(
-                    f"Invalid action mask shape {tuple(invalid_mask.shape)}; "
-                    f"expected {(gather_index.shape[0], num_actions)}"
-                )
-            invalid_mask = invalid_mask.to(device=gather_index.device, dtype=torch.bool).clone()
-
-        all_invalid = invalid_mask.all(dim=1)
-        if all_invalid.any():
-            invalid_mask[all_invalid, 0] = False
-
-        in_range = (gather_index >= 0) & (gather_index < num_actions)
-        bounded_index = gather_index.clamp(min=0, max=num_actions - 1)
-        chosen_invalid = ~in_range | torch.gather(invalid_mask, 1, bounded_index)
-        first_valid = (~invalid_mask).to(dtype=torch.int64).argmax(dim=1, keepdim=True)
-        return torch.where(chosen_invalid, first_valid, bounded_index)
+        return sanitize_discrete_action_indices(gather_index, invalid_mask, num_actions=num_actions)
 
     def _to_device_recursive(self, value: Any) -> Any:
         """Move tensors in nested replay values to the configured device."""
-        if torch.is_tensor(value):
-            return value.to(self.device, non_blocking=True)
-        if isinstance(value, list):
-            return [self._to_device_recursive(item) for item in value]
-        if isinstance(value, tuple):
-            return tuple(self._to_device_recursive(item) for item in value)
-        if isinstance(value, dict):
-            return {key: self._to_device_recursive(item) for key, item in value.items()}
-        return value
+        return move_to_device_recursive(value, self.device)
 
     def init(self, *, trainer_cfg: dict[str, Any] | None = None) -> None:
         super().init(trainer_cfg=trainer_cfg)
@@ -453,11 +382,7 @@ class DiscreteSAC(Agent):
 
             self.scaler.update()
 
-            self._target_update_counter += 1
-            if self._target_update_counter > self.cfg.steps_to_target_net_update:
-                self.target_critic_1.update_parameters(self.critic_1, polyak=self.cfg.polyak)
-                self.target_critic_2.update_parameters(self.critic_2, polyak=self.cfg.polyak)
-                self._target_update_counter = 1
+            update_target_critics(self)
 
             if self.policy_scheduler:
                 self.policy_scheduler.step()
