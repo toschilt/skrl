@@ -6,6 +6,7 @@ from an isolated skrl checkout with the Torch test dependencies installed.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import gymnasium
@@ -18,7 +19,6 @@ from skrl.agents.torch.sac.discrete_sac_cfg_factorized import FACTORIZED_DISCRET
 from skrl.agents.torch.sac.discrete_sac_factorized_simple import FactorizedDiscreteSACSimple
 from skrl.memories.torch.replay import ReplayBuffer
 from skrl.models.torch import Model
-
 
 N_POSITION_ACTIONS = 3
 N_ORIENTATION_ACTIONS = 2
@@ -34,9 +34,7 @@ class FactorizedPolicy(Model):
             high=1,
             shape=(OBSERVATION_SIZE,),
         )
-        action_space = gymnasium.spaces.MultiDiscrete(
-            [N_POSITION_ACTIONS, N_ORIENTATION_ACTIONS]
-        )
+        action_space = gymnasium.spaces.MultiDiscrete([N_POSITION_ACTIONS, N_ORIENTATION_ACTIONS])
         super().__init__(
             observation_space=observation_space,
             action_space=action_space,
@@ -92,9 +90,7 @@ class FactorizedCritic(Model):
             high=1,
             shape=(OBSERVATION_SIZE,),
         )
-        action_space = gymnasium.spaces.MultiDiscrete(
-            [N_POSITION_ACTIONS, N_ORIENTATION_ACTIONS]
-        )
+        action_space = gymnasium.spaces.MultiDiscrete([N_POSITION_ACTIONS, N_ORIENTATION_ACTIONS])
         super().__init__(
             observation_space=observation_space,
             action_space=action_space,
@@ -174,26 +170,31 @@ class CountingReplayBuffer(ReplayBuffer):
         )
 
 
+class MultiplyPreprocessor:
+    """Deterministic callable preprocessor used to observe agent input routing."""
+
+    def __init__(self, *, multiplier: float) -> None:
+        self.multiplier = multiplier
+
+    def __call__(self, value: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        del args, kwargs
+        return value * self.multiplier
+
+
 def _spaces() -> tuple[gymnasium.Space, gymnasium.Space]:
     observation_space = gymnasium.spaces.Box(
         low=-1,
         high=1,
         shape=(OBSERVATION_SIZE,),
     )
-    action_space = gymnasium.spaces.MultiDiscrete(
-        [N_POSITION_ACTIONS, N_ORIENTATION_ACTIONS]
-    )
+    action_space = gymnasium.spaces.MultiDiscrete([N_POSITION_ACTIONS, N_ORIENTATION_ACTIONS])
     return observation_space, action_space
 
 
 def _states(batch_size: int, *, pad_last_position: bool = False) -> list[torch.Tensor]:
     state_parts = [torch.zeros(batch_size, 1) for _ in range(8)]
     state_parts[4] = torch.zeros(batch_size, 1, 1, dtype=torch.long)
-    state_parts[6] = (
-        torch.arange(N_POSITION_ACTIONS)
-        .reshape(1, N_POSITION_ACTIONS, 1)
-        .repeat(batch_size, 1, 1)
-    )
+    state_parts[6] = torch.arange(N_POSITION_ACTIONS).reshape(1, N_POSITION_ACTIONS, 1).repeat(batch_size, 1, 1)
     state_parts[7] = torch.zeros(
         batch_size,
         1,
@@ -205,9 +206,12 @@ def _states(batch_size: int, *, pad_last_position: bool = False) -> list[torch.T
     return state_parts
 
 
-def _agent(memory: ReplayBuffer | None = None) -> FactorizedDiscreteSACSimple:
+def _agent(
+    memory: ReplayBuffer | None = None,
+    **overrides: Any,
+) -> FactorizedDiscreteSACSimple:
     observation_space, action_space = _spaces()
-    cfg = FACTORIZED_DISCRETE_SAC_CFG(
+    cfg_kwargs = dict(
         gradient_steps=1,
         batch_size=4,
         learning_rate=(1e-3, 1e-3, 1e-3),
@@ -218,6 +222,8 @@ def _agent(memory: ReplayBuffer | None = None) -> FactorizedDiscreteSACSimple:
         mixed_precision=False,
         experiment=ExperimentCfg(write_interval=0, checkpoint_interval=0),
     )
+    cfg_kwargs.update(overrides)
+    cfg = FACTORIZED_DISCRETE_SAC_CFG(**cfg_kwargs)
     models = {
         "policy": FactorizedPolicy(),
         "critic_1": FactorizedCritic(),
@@ -236,6 +242,29 @@ def _agent(memory: ReplayBuffer | None = None) -> FactorizedDiscreteSACSimple:
     )
 
 
+def _record_batch(agent: FactorizedDiscreteSACSimple, *, position_action: int = 1) -> None:
+    """Store one deterministic batch that is valid for the standard state fixture."""
+    batch_size = 8
+    agent.record_transition(
+        observations=torch.arange(batch_size * OBSERVATION_SIZE, dtype=torch.float32).reshape(
+            batch_size, OBSERVATION_SIZE
+        ),
+        states=_states(batch_size),
+        actions=torch.tensor(
+            [[position_action, index % N_ORIENTATION_ACTIONS] for index in range(batch_size)],
+            dtype=torch.float32,
+        ),
+        rewards=torch.ones(batch_size, 1),
+        next_observations=torch.zeros(batch_size, OBSERVATION_SIZE),
+        next_states=_states(batch_size),
+        terminated=torch.zeros(batch_size, 1, dtype=torch.bool),
+        truncated=torch.zeros(batch_size, 1, dtype=torch.bool),
+        infos={},
+        timestep=0,
+        timesteps=1,
+    )
+
+
 def test_factorized_configuration_defaults() -> None:
     cfg = FACTORIZED_DISCRETE_SAC_CFG()
 
@@ -251,19 +280,15 @@ def test_factorized_configuration_defaults() -> None:
 
 def test_position_mask_distribution_and_action_sanitization() -> None:
     states = _states(2, pad_last_position=True)
-    invalid_mask = FactorizedDiscreteSACSimple._build_position_invalid_mask_from_states(
-        states
-    )
+    invalid_mask = FactorizedDiscreteSACSimple._build_position_invalid_mask_from_states(states)
 
     assert invalid_mask.shape == (2, N_POSITION_ACTIONS)
     assert invalid_mask.tolist() == [[True, False, True], [True, False, True]]
 
     logits = torch.tensor([[10.0, 2.0, 5.0], [1.0, 3.0, 7.0]])
-    log_probabilities, probabilities = (
-        FactorizedDiscreteSACSimple._masked_position_distribution(
-            logits,
-            invalid_mask,
-        )
+    log_probabilities, probabilities = FactorizedDiscreteSACSimple._masked_position_distribution(
+        logits,
+        invalid_mask,
     )
 
     assert log_probabilities.shape == probabilities.shape == (2, N_POSITION_ACTIONS)
@@ -280,11 +305,9 @@ def test_position_mask_distribution_and_action_sanitization() -> None:
     assert sanitized.tolist() == [1, 1]
 
     all_invalid = torch.ones(1, N_POSITION_ACTIONS, dtype=torch.bool)
-    _, fallback_probabilities = (
-        FactorizedDiscreteSACSimple._masked_position_distribution(
-            torch.zeros(1, N_POSITION_ACTIONS),
-            all_invalid,
-        )
+    _, fallback_probabilities = FactorizedDiscreteSACSimple._masked_position_distribution(
+        torch.zeros(1, N_POSITION_ACTIONS),
+        all_invalid,
     )
     assert fallback_probabilities.tolist() == [[1.0, 0.0, 0.0]]
 
@@ -299,12 +322,10 @@ def test_action_policy_entropy_and_critic_shapes() -> None:
         timestep=0,
         timesteps=1,
     )
-    logits_position, logits_orientation = agent._extract_factorized_policy_outputs(
-        outputs
-    )
+    logits_position, logits_orientation = agent._extract_factorized_policy_outputs(outputs)
     invalid_mask = torch.zeros(5, N_POSITION_ACTIONS, dtype=torch.bool)
-    position_log_probabilities, position_probabilities = (
-        agent._masked_position_distribution(logits_position, invalid_mask)
+    position_log_probabilities, position_probabilities = agent._masked_position_distribution(
+        logits_position, invalid_mask
     )
     orientation_log_probabilities = torch.log_softmax(
         logits_orientation,
@@ -325,9 +346,7 @@ def test_action_policy_entropy_and_critic_shapes() -> None:
     )
     assert position_log_probabilities.shape == position_probabilities.shape
     assert orientation_log_probabilities.shape == orientation_probabilities.shape
-    assert agent._target_position_entropy == pytest.approx(
-        torch.log(torch.tensor(float(N_POSITION_ACTIONS))).item()
-    )
+    assert agent._target_position_entropy == pytest.approx(torch.log(torch.tensor(float(N_POSITION_ACTIONS))).item())
     assert agent._target_orientation_entropy == pytest.approx(
         torch.log(torch.tensor(float(N_ORIENTATION_ACTIONS))).item()
     )
@@ -398,26 +417,190 @@ def test_baseline_replay_fallback_and_synthetic_update() -> None:
         1,
     )
 
-    policy_before = [
-        parameter.detach().clone() for parameter in agent.policy.parameters()
-    ]
+    policy_before = [parameter.detach().clone() for parameter in agent.policy.parameters()]
     agent.update(timestep=1, timesteps=1)
 
     assert memory.sample_calls == 2
-    assert any(
-        not torch.equal(before, after)
-        for before, after in zip(policy_before, agent.policy.parameters())
-    )
-    assert agent._target_position_entropy == pytest.approx(
-        torch.log(torch.tensor(float(N_POSITION_ACTIONS))).item()
-    )
+    assert any(not torch.equal(before, after) for before, after in zip(policy_before, agent.policy.parameters()))
+    assert agent._target_position_entropy == pytest.approx(torch.log(torch.tensor(float(N_POSITION_ACTIONS))).item())
     assert agent._target_orientation_entropy == pytest.approx(
         torch.log(torch.tensor(float(N_ORIENTATION_ACTIONS))).item()
     )
     for critic in (agent.critic_1, agent.critic_2):
         assert critic.selected_action_shapes
-        position_shape, orientation_shape, gathered_shape = (
-            critic.selected_action_shapes[-1]
-        )
+        position_shape, orientation_shape, gathered_shape = critic.selected_action_shapes[-1]
         assert position_shape == orientation_shape == torch.Size([agent.cfg.batch_size])
         assert gathered_shape == torch.Size([agent.cfg.batch_size, 1])
+
+
+@pytest.mark.parametrize(
+    ("position_target", "orientation_target"),
+    [(0.0, 0.5), (1.25, 2.5)],
+)
+def test_explicit_entropy_targets_are_preserved(
+    position_target: float,
+    orientation_target: float,
+) -> None:
+    agent = _agent(
+        target_position_entropy=position_target,
+        target_orientation_entropy=orientation_target,
+    )
+
+    agent._resolve_target_entropies(N_POSITION_ACTIONS, N_ORIENTATION_ACTIONS)
+
+    assert agent._target_position_entropy == position_target
+    assert agent._target_orientation_entropy == orientation_target
+
+
+@pytest.mark.parametrize("bad_neighbors", [torch.zeros(2, 3, 1, 1), torch.zeros(2)])
+def test_position_mask_rejects_unsupported_neighbor_dimensions(
+    bad_neighbors: torch.Tensor,
+) -> None:
+    states = _states(2)
+    states[6] = bad_neighbors
+
+    with pytest.raises(ValueError, match="current_neighbors must have dim 2 or 3"):
+        FactorizedDiscreteSACSimple._build_position_invalid_mask_from_states(states)
+
+
+@pytest.mark.parametrize("outputs", [{}, {"logits_pos": torch.zeros(1, 3)}])
+def test_policy_output_contract_requires_both_factorized_logits(outputs: dict[str, torch.Tensor]) -> None:
+    with pytest.raises(RuntimeError, match="logits_pos.*logits_rot"):
+        FactorizedDiscreteSACSimple._extract_factorized_policy_outputs(outputs)
+
+
+def test_conservative_penalty_and_q_diagnostics_exclude_invalid_actions() -> None:
+    q_all = torch.tensor([[[1.0, 100.0], [2.0, 3.0], [4.0, 5.0]]])
+    q_taken = torch.tensor([[2.0]])
+    invalid_position_mask = torch.tensor([[True, False, False]])
+    invalid_orientation_mask = torch.tensor([[[False, False], [False, True], [True, True]]])
+
+    penalty = FactorizedDiscreteSACSimple._conservative_q_penalty(
+        q_all,
+        q_taken,
+        invalid_position_mask,
+        temperature=0.0,
+        invalid_action_mask=invalid_orientation_mask,
+    )
+    diagnostics = FactorizedDiscreteSACSimple._factorized_q_policy_diagnostics(
+        q_all,
+        torch.tensor([[0.8, 0.1, 0.1]]),
+        torch.full((1, 3, 2), 0.5),
+        invalid_position_mask,
+        invalid_orientation_mask,
+    )
+
+    assert penalty == pytest.approx(0.0, abs=1e-4)
+    assert diagnostics["q_all_max"].item() == 2.0
+    assert diagnostics["q_max_action_position_mean"].item() == 1.0
+    assert diagnostics["q_max_action_orientation_mean"].item() == 0.0
+
+
+def test_delayed_actor_updates_and_learning_start_gate_policy_gradients() -> None:
+    torch.manual_seed(11)
+    memory = CountingReplayBuffer()
+    agent = _agent(memory, actor_update_delay=2, actor_learning_starts=2)
+    agent.init()
+    _record_batch(agent)
+    policy_before = [parameter.detach().clone() for parameter in agent.policy.parameters()]
+
+    agent.update(timestep=1, timesteps=3)
+
+    assert all(torch.equal(before, after) for before, after in zip(policy_before, agent.policy.parameters()))
+    assert agent._gradient_update_counter == 1
+
+    agent.update(timestep=2, timesteps=3)
+
+    assert any(not torch.equal(before, after) for before, after in zip(policy_before, agent.policy.parameters()))
+    assert agent._gradient_update_counter == 2
+
+
+def test_entropy_disabled_keeps_manual_target_unchanged() -> None:
+    agent = _agent(learn_entropy=False)
+
+    agent.set_curriculum_entropy_target((0.3, 0.7))
+
+    assert not hasattr(agent, "entropy_coefficients")
+    assert agent._target_position_entropy is None
+    assert agent._target_orientation_entropy is None
+
+
+def test_act_routes_observations_and_fallback_states_through_preprocessors() -> None:
+    agent = _agent(
+        observation_preprocessor=MultiplyPreprocessor,
+        observation_preprocessor_kwargs={"multiplier": 2.0},
+        state_preprocessor=MultiplyPreprocessor,
+        state_preprocessor_kwargs={"multiplier": 3.0},
+    )
+    captured: dict[str, torch.Tensor] = {}
+    original_act = agent.policy.act
+
+    def capture(inputs: dict[str, torch.Tensor], *, role: str = "") -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        captured.update(inputs)
+        return original_act(inputs, role=role)
+
+    agent.policy.act = capture  # type: ignore[method-assign]
+    observations = torch.ones(2, OBSERVATION_SIZE)
+    agent.act(observations, None, timestep=0, timesteps=1)
+
+    assert torch.equal(captured["observations"], observations * 2)
+    assert torch.equal(captured["states"], observations * 3)
+
+
+def test_invalid_replay_action_threshold_fails_before_critic_update() -> None:
+    memory = CountingReplayBuffer()
+    agent = _agent(memory, invalid_replay_action_fail_threshold=0.0)
+    agent.init()
+    _record_batch(agent, position_action=0)
+
+    with pytest.raises(RuntimeError, match="Replay sampled invalid position actions"):
+        agent.update(timestep=1, timesteps=1)
+
+
+@pytest.mark.parametrize("sequential", [False, True])
+def test_critic_update_modes_and_gradient_clipping(
+    monkeypatch: pytest.MonkeyPatch,
+    sequential: bool,
+) -> None:
+    memory = CountingReplayBuffer()
+    agent = _agent(
+        memory,
+        sequential_critic_update=sequential,
+        conservative_q_regularization_scale=0.25,
+        policy_grad_norm_clip=0.5,
+        q_network_grad_norm_clip=0.5,
+    )
+    agent.init()
+    _record_batch(agent)
+    calls: list[float] = []
+    original_clip = torch.nn.utils.clip_grad_norm_
+
+    def record_clip(parameters: Any, max_norm: float, *args: Any, **kwargs: Any) -> torch.Tensor:
+        calls.append(max_norm)
+        return original_clip(parameters, max_norm, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", record_clip)
+    agent.update(timestep=1, timesteps=1)
+
+    assert calls.count(0.5) >= 2
+    assert agent._gradient_update_counter == 1
+
+
+def test_save_load_round_trip_preserves_models_and_optimizer_state(tmp_path: Path) -> None:
+    memory = CountingReplayBuffer()
+    agent = _agent(memory)
+    agent.init()
+    _record_batch(agent)
+    agent.update(timestep=1, timesteps=1)
+    checkpoint = tmp_path / "factorized-sac.pt"
+    agent.save(str(checkpoint))
+
+    restored = _agent()
+    restored.load(str(checkpoint))
+
+    assert checkpoint.exists()
+    assert restored.checkpoint_modules.keys() == agent.checkpoint_modules.keys()
+    for expected, actual in zip(agent.policy.parameters(), restored.policy.parameters()):
+        assert torch.equal(expected, actual)
+    assert restored.policy_optimizer.state_dict()["state"]
+    assert restored.position_entropy_optimizer.state_dict()["state"]
