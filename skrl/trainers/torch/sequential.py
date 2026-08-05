@@ -138,9 +138,17 @@ class SequentialTrainer(Trainer):
                             for agent in self.agents:
                                 agent.track_data(k if "/" in k else f"Info / {k}", v.item())
 
-            # post-interaction
+            should_stop = any(
+                self._check_convergence(timestep + 1, agent) for agent in self.agents
+            )
+
+            # post-interaction writes TensorBoard data and clears tracking_data,
+            # so convergence must be sampled before this cleanup.
             for agent in self.agents:
                 agent.post_interaction(timestep=timestep, timesteps=self.cfg.timesteps)
+
+            if should_stop:
+                break
 
             # reset environments
             # - parallel/vectorized environments (single or multi-agent)

@@ -70,6 +70,25 @@ class TrainerCfg(ABC):
 
 
 class Trainer(ABC):
+    def _check_convergence(self, timestep: int, agent=None) -> bool:
+        """Invoke an optional write-interval convergence policy."""
+        convergence = getattr(self.cfg, "convergence_wrapper", None)
+        if convergence is None:
+            return False
+        agent = self.agents if agent is None else agent
+        write_interval = getattr(agent, "write_interval", 0)
+        if write_interval <= 0 or timestep % write_interval:
+            return False
+        rewards = getattr(agent, "tracking_data", {}).get(
+            "Reward / Total reward (mean)", []
+        )
+        if not rewards:
+            report_unavailable = getattr(convergence, "report_unavailable", None)
+            if report_unavailable is not None:
+                report_unavailable(timestep)
+            return False
+        return bool(convergence.observe(timestep, {"Reward / Total reward (mean)": rewards[-1]}))
+
     def __init__(
         self,
         *,
@@ -247,8 +266,14 @@ class Trainer(ABC):
                                 self.agents.track_data(f"Info / {k} (min)", v_)
                                 self.agents.track_data(f"Info / {k} (max)", v_)
 
-            # post-interaction
+            should_stop = self._check_convergence(timestep + 1)
+
+            # post-interaction writes TensorBoard data and clears tracking_data,
+            # so convergence must be sampled before this cleanup.
             self.agents.post_interaction(timestep=timestep, timesteps=self.cfg.timesteps)
+
+            if should_stop:
+                break
 
             # reset environments
             # - parallel/vectorized environments (single or multi-agent)
