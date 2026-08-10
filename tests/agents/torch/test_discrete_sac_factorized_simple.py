@@ -242,21 +242,26 @@ def _agent(
     )
 
 
-def _record_batch(agent: FactorizedDiscreteSACSimple, *, position_action: int = 1) -> None:
+def _record_batch(
+    agent: FactorizedDiscreteSACSimple,
+    *,
+    position_action: int = 1,
+    pad_last_position: bool = False,
+) -> None:
     """Store one deterministic batch that is valid for the standard state fixture."""
     batch_size = 8
     agent.record_transition(
         observations=torch.arange(batch_size * OBSERVATION_SIZE, dtype=torch.float32).reshape(
             batch_size, OBSERVATION_SIZE
         ),
-        states=_states(batch_size),
+        states=_states(batch_size, pad_last_position=pad_last_position),
         actions=torch.tensor(
             [[position_action, index % N_ORIENTATION_ACTIONS] for index in range(batch_size)],
             dtype=torch.float32,
         ),
         rewards=torch.ones(batch_size, 1),
         next_observations=torch.zeros(batch_size, OBSERVATION_SIZE),
-        next_states=_states(batch_size),
+        next_states=_states(batch_size, pad_last_position=pad_last_position),
         terminated=torch.zeros(batch_size, 1, dtype=torch.bool),
         truncated=torch.zeros(batch_size, 1, dtype=torch.bool),
         infos={},
@@ -283,7 +288,7 @@ def test_position_mask_distribution_and_action_sanitization() -> None:
     invalid_mask = FactorizedDiscreteSACSimple._build_position_invalid_mask_from_states(states)
 
     assert invalid_mask.shape == (2, N_POSITION_ACTIONS)
-    assert invalid_mask.tolist() == [[True, False, True], [True, False, True]]
+    assert invalid_mask.tolist() == [[False, False, True], [False, False, True]]
 
     logits = torch.tensor([[10.0, 2.0, 5.0], [1.0, 3.0, 7.0]])
     log_probabilities, probabilities = FactorizedDiscreteSACSimple._masked_position_distribution(
@@ -294,15 +299,14 @@ def test_position_mask_distribution_and_action_sanitization() -> None:
     assert log_probabilities.shape == probabilities.shape == (2, N_POSITION_ACTIONS)
     assert torch.isfinite(log_probabilities).all()
     assert torch.allclose(probabilities.sum(dim=-1), torch.ones(2))
-    assert torch.equal(probabilities[:, 0], torch.zeros(2))
-    assert torch.equal(probabilities[:, 1], torch.ones(2))
+    assert probabilities[:, :2].argmax(dim=-1).tolist() == [0, 1]
     assert torch.equal(probabilities[:, 2], torch.zeros(2))
 
     sanitized = FactorizedDiscreteSACSimple._sanitize_position_actions(
         torch.tensor([0, 99]),
         invalid_mask,
     )
-    assert sanitized.tolist() == [1, 1]
+    assert sanitized.tolist() == [0, 0]
 
     all_invalid = torch.ones(1, N_POSITION_ACTIONS, dtype=torch.bool)
     _, fallback_probabilities = FactorizedDiscreteSACSimple._masked_position_distribution(
@@ -452,14 +456,14 @@ def test_explicit_entropy_targets_are_preserved(
     assert agent._target_orientation_entropy == orientation_target
 
 
-@pytest.mark.parametrize("bad_neighbors", [torch.zeros(2, 3, 1, 1), torch.zeros(2)])
-def test_position_mask_rejects_unsupported_neighbor_dimensions(
-    bad_neighbors: torch.Tensor,
+@pytest.mark.parametrize("bad_padding", [torch.zeros(2, 3, 1, 1), torch.zeros(2)])
+def test_position_mask_rejects_unsupported_padding_dimensions(
+    bad_padding: torch.Tensor,
 ) -> None:
     states = _states(2)
-    states[6] = bad_neighbors
+    states[7] = bad_padding
 
-    with pytest.raises(ValueError, match="current_neighbors must have dim 2 or 3"):
+    with pytest.raises(ValueError, match="edge_padding_mask must have dim 2 or 3"):
         FactorizedDiscreteSACSimple._build_position_invalid_mask_from_states(states)
 
 
@@ -551,7 +555,7 @@ def test_invalid_replay_action_threshold_fails_before_critic_update() -> None:
     memory = CountingReplayBuffer()
     agent = _agent(memory, invalid_replay_action_fail_threshold=0.0)
     agent.init()
-    _record_batch(agent, position_action=0)
+    _record_batch(agent, position_action=2, pad_last_position=True)
 
     with pytest.raises(RuntimeError, match="Replay sampled invalid position actions"):
         agent.update(timestep=1, timesteps=1)

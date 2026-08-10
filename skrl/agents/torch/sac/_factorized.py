@@ -32,24 +32,26 @@ def resolve_target_entropies(
 
 
 def build_position_invalid_mask_from_states(states: Any) -> torch.Tensor:
-    """Derive invalid positions from the factorized state padding and current node."""
-    current_index = states[4]
-    current_neighbors = states[6]
+    """Return the exact position-action mask stored with a replay state.
+
+    The environment builds this padding mask together with the packed neighbor
+    slots seen by the actor.  Do not infer an additional self-node mask from
+    ``current_index``: local node IDs can be remapped by observation/graph
+    variants, and the stay-and-rotate ablation deliberately leaves that slot
+    valid.  The stored padding mask is therefore the single action-validity
+    contract for both sampling and replay.
+    """
     edge_padding_mask = states[7]
-    if current_neighbors.dim() == 2:
-        current_neighbors = current_neighbors.unsqueeze(-1).long()
-    elif current_neighbors.dim() == 3:
-        current_neighbors = current_neighbors.long()
-    else:
-        raise ValueError(f"current_neighbors must have dim 2 or 3, got {current_neighbors.dim()}")
-    if current_index.dim() == 3:
-        current_node_idx = current_index.squeeze(-1).squeeze(-1).long()
-    elif current_index.dim() == 2:
-        current_node_idx = current_index.squeeze(-1).long()
-    else:
-        current_node_idx = current_index.long()
-    invalid_mask = edge_padding_mask.squeeze(1).bool() if edge_padding_mask.dim() == 3 else edge_padding_mask.bool()
-    return invalid_mask | (current_neighbors.squeeze(-1) == current_node_idx.view(-1, 1))
+    if edge_padding_mask.dim() not in (2, 3):
+        raise ValueError(
+            "edge_padding_mask must have dim 2 or 3, "
+            f"got {edge_padding_mask.dim()}"
+        )
+    return (
+        edge_padding_mask.squeeze(1).bool()
+        if edge_padding_mask.dim() == 3
+        else edge_padding_mask.bool()
+    )
 
 
 def masked_position_distribution(

@@ -71,23 +71,20 @@ class TrainerCfg(ABC):
 
 class Trainer(ABC):
     def _check_convergence(self, timestep: int, agent=None) -> bool:
-        """Invoke an optional write-interval convergence policy."""
-        convergence = getattr(self.cfg, "convergence_wrapper", None)
-        if convergence is None:
+        """Retain the old hook without making training metrics authoritative.
+
+        Convergence is now evaluated by the periodic validation callback after
+        a complete validation pass. This compatibility method intentionally
+        does not inspect training tracking data.
+        """
+        return False
+
+    def _run_periodic_validation(self, timestep: int) -> bool:
+        """Run validation after logging and return its convergence decision."""
+        callback = getattr(self.cfg, "periodic_validation_callback", None)
+        if callback is None:
             return False
-        agent = self.agents if agent is None else agent
-        write_interval = getattr(agent, "write_interval", 0)
-        if write_interval <= 0 or timestep % write_interval:
-            return False
-        rewards = getattr(agent, "tracking_data", {}).get(
-            "Reward / Total reward (mean)", []
-        )
-        if not rewards:
-            report_unavailable = getattr(convergence, "report_unavailable", None)
-            if report_unavailable is not None:
-                report_unavailable(timestep)
-            return False
-        return bool(convergence.observe(timestep, {"Reward / Total reward (mean)": rewards[-1]}))
+        return bool(callback.maybe_run(timestep=timestep, timesteps=self.cfg.timesteps))
 
     def __init__(
         self,
@@ -266,11 +263,9 @@ class Trainer(ABC):
                                 self.agents.track_data(f"Info / {k} (min)", v_)
                                 self.agents.track_data(f"Info / {k} (max)", v_)
 
-            should_stop = self._check_convergence(timestep + 1)
-
-            # post-interaction writes TensorBoard data and clears tracking_data,
-            # so convergence must be sampled before this cleanup.
+            # post-interaction writes TensorBoard data and clears tracking_data.
             self.agents.post_interaction(timestep=timestep, timesteps=self.cfg.timesteps)
+            should_stop = self._run_periodic_validation(timestep + 1)
 
             if should_stop:
                 break

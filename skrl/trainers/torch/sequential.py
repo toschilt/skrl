@@ -138,14 +138,9 @@ class SequentialTrainer(Trainer):
                             for agent in self.agents:
                                 agent.track_data(k if "/" in k else f"Info / {k}", v.item())
 
-            should_stop = any(
-                self._check_convergence(timestep + 1, agent) for agent in self.agents
-            )
-
-            # post-interaction writes TensorBoard data and clears tracking_data,
-            # so convergence must be sampled before this cleanup.
             for agent in self.agents:
                 agent.post_interaction(timestep=timestep, timesteps=self.cfg.timesteps)
+            should_stop = self._run_periodic_validation(timestep + 1)
 
             if should_stop:
                 break

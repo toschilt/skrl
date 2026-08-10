@@ -152,6 +152,9 @@ def _make_agent(
     learn_entropy: bool = False,
     state_preprocessor: type[torch.nn.Module] | None = None,
     random_timesteps: int = 0,
+    actor_learning_starts: int = 0,
+    skip_previous_done_transitions: bool = False,
+    sequential_critic_update: bool = False,
 ) -> DiscreteSAC:
     models = {
         "policy": _SyntheticPolicy(contract, invalid_action_mask),
@@ -167,6 +170,9 @@ def _make_agent(
         state_preprocessor=state_preprocessor,
         state_preprocessor_kwargs={"offset": 2.0} if state_preprocessor is not None else {},
         steps_to_target_net_update=64,
+        actor_learning_starts=actor_learning_starts,
+        skip_previous_done_transitions=skip_previous_done_transitions,
+        sequential_critic_update=sequential_critic_update,
         experiment={
             "directory": "",
             "experiment_name": "test",
@@ -340,6 +346,73 @@ def test_record_transition_uses_explicit_states_and_preserves_nested_payloads() 
     assert transition["states"] is observations
     assert transition["next_observations"] is next_observations
     assert transition["next_states"] is next_observations
+
+
+def test_record_transition_skips_auto_reset_bridge_rows() -> None:
+    sample = _nested_replay_sample()
+    memory = _RecordingReplay(sample)
+    agent = _make_agent(
+        "logits",
+        sample,
+        _invalid_action_mask(),
+        memory=memory,
+        skip_previous_done_transitions=True,
+    )
+    payload = dict(
+        observations={"features": torch.arange(6).reshape(3, 2)},
+        states=None,
+        actions=torch.tensor([[0.0], [1.0], [2.0]]),
+        rewards=torch.ones(3, 1),
+        next_observations={"features": torch.arange(6).reshape(3, 2) + 1},
+        next_states=None,
+        truncated=torch.zeros(3, 1, dtype=torch.bool),
+        infos={},
+        timestep=0,
+        timesteps=2,
+    )
+    agent.record_transition(
+        **payload,
+        terminated=torch.tensor([[False], [True], [False]]),
+    )
+    agent.record_transition(
+        **payload,
+        terminated=torch.zeros(3, 1, dtype=torch.bool),
+    )
+    assert len(memory.transitions) == 2
+    assert memory.transitions[1]["actions"].reshape(-1).tolist() == [0.0, 2.0]
+
+
+def test_actor_update_can_start_after_critic_updates() -> None:
+    agent = _make_agent(
+        "logits",
+        _nested_replay_sample(),
+        _invalid_action_mask(),
+        actor_learning_starts=10,
+    )
+    actor_before = next(agent.policy.parameters()).detach().clone()
+    critic_before = next(agent.critic_1.parameters()).detach().clone()
+    agent.update(timestep=5, timesteps=20)
+    torch.testing.assert_close(actor_before, next(agent.policy.parameters()))
+    assert not torch.equal(critic_before, next(agent.critic_1.parameters()))
+
+
+def test_sequential_critic_update_keeps_actor_frozen_before_its_start() -> None:
+    agent = _make_agent(
+        "logits",
+        _nested_replay_sample(),
+        _invalid_action_mask(),
+        actor_learning_starts=10,
+        sequential_critic_update=True,
+    )
+    actor_before = next(agent.policy.parameters()).detach().clone()
+    critic_1_before = next(agent.critic_1.parameters()).detach().clone()
+    critic_2_before = next(agent.critic_2.parameters()).detach().clone()
+
+    agent.update(timestep=5, timesteps=20)
+
+    torch.testing.assert_close(actor_before, next(agent.policy.parameters()))
+    assert not torch.equal(critic_1_before, next(agent.critic_1.parameters()))
+    assert not torch.equal(critic_2_before, next(agent.critic_2.parameters()))
 
 
 @pytest.mark.parametrize("device", ["cpu"])

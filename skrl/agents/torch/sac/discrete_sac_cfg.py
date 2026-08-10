@@ -18,6 +18,18 @@ class DISCRETE_SAC_CFG(SAC_CFG):
     q_network_grad_norm_clip: float = 0
     """Critic gradient clipping coefficient by global norm."""
 
+    actor_learning_starts: int = 0
+    """Timestep at which actor and entropy updates may begin."""
+
+    actor_update_delay: int = 1
+    """Number of critic gradient updates between actor updates."""
+
+    skip_previous_done_transitions: bool = False
+    """Do not store auto-reset bridge transitions following completed episodes."""
+
+    sequential_critic_update: bool = False
+    """Backpropagate the two critics one at a time to reduce peak memory."""
+
     def expand(self) -> None:
         """Expand the configuration."""
         super().expand()

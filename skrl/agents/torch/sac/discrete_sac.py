@@ -74,6 +74,8 @@ class DiscreteSAC(Agent):
         initialize_target_critics(self.target_critic_1, self.target_critic_2, self.critic_1, self.critic_2)
 
         self._target_update_counter = 1
+        self._gradient_update_counter = 0
+        self._previous_done_mask = None
 
         self._entropy_coefficient = self.cfg.initial_entropy_value
         if self.cfg.learn_entropy:
@@ -144,6 +146,21 @@ class DiscreteSAC(Agent):
         """Move tensors in nested replay values to the configured device."""
         return move_to_device_recursive(value, self.device)
 
+    def _filter_transition_batch(self, value: Any, mask: torch.Tensor) -> Any:
+        """Select environment rows in nested replay payloads."""
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            mask = mask.to(device=value.device, dtype=torch.bool)
+            return value[mask] if value.ndim > 0 and value.shape[0] == mask.shape[0] else value
+        if isinstance(value, list):
+            return [self._filter_transition_batch(item, mask) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._filter_transition_batch(item, mask) for item in value)
+        if isinstance(value, dict):
+            return {key: self._filter_transition_batch(item, mask) for key, item in value.items()}
+        return value
+
     def init(self, *, trainer_cfg: dict[str, Any] | None = None) -> None:
         super().init(trainer_cfg=trainer_cfg)
         self.enable_models_training_mode(False)
@@ -204,6 +221,16 @@ class DiscreteSAC(Agent):
         timestep: int,
         timesteps: int,
     ) -> None:
+        done_mask = (terminated.detach().bool() | truncated.detach().bool()).view(-1)
+        previous_done_mask = self._previous_done_mask
+        if (
+            previous_done_mask is None
+            or previous_done_mask.numel() != done_mask.numel()
+            or previous_done_mask.device != done_mask.device
+        ):
+            previous_done_mask = torch.zeros_like(done_mask)
+        store_mask = ~previous_done_mask.to(device=done_mask.device, dtype=torch.bool)
+
         super().record_transition(
             observations=observations,
             states=states,
@@ -225,6 +252,21 @@ class DiscreteSAC(Agent):
             states = self._get_states(observations, states)
             next_states = self._get_states(next_observations, next_states)
 
+            if self.cfg.skip_previous_done_transitions:
+                skipped_fraction = 1.0 - float(store_mask.float().mean().item())
+                self.track_data("Replay/stale_done_transition_skipped_fraction", skipped_fraction)
+                if not bool(store_mask.any().item()):
+                    self._previous_done_mask = done_mask.detach().clone()
+                    return
+                observations = self._filter_transition_batch(observations, store_mask)
+                states = self._filter_transition_batch(states, store_mask)
+                actions = self._filter_transition_batch(actions, store_mask)
+                rewards = self._filter_transition_batch(rewards, store_mask)
+                next_observations = self._filter_transition_batch(next_observations, store_mask)
+                next_states = self._filter_transition_batch(next_states, store_mask)
+                terminated = self._filter_transition_batch(terminated, store_mask)
+                truncated = self._filter_transition_batch(truncated, store_mask)
+
             self.memory.add_samples(
                 observations=observations,
                 states=states,
@@ -235,6 +277,7 @@ class DiscreteSAC(Agent):
                 terminated=terminated,
                 truncated=truncated,
             )
+        self._previous_done_mask = done_mask.detach().clone()
 
     def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
         pass
@@ -251,6 +294,11 @@ class DiscreteSAC(Agent):
 
     def update(self, *, timestep: int, timesteps: int) -> None:
         for gradient_step in range(self.cfg.gradient_steps):
+            self._gradient_update_counter += 1
+            update_actor = (
+                timestep >= max(self.cfg.learning_starts, self.cfg.actor_learning_starts)
+                and self._gradient_update_counter % max(1, self.cfg.actor_update_delay) == 0
+            )
             (
                 sampled_observations,
                 sampled_states,
@@ -271,40 +319,44 @@ class DiscreteSAC(Agent):
             sampled_terminated = self._to_device_recursive(sampled_terminated)
             sampled_truncated = self._to_device_recursive(sampled_truncated)
 
-            with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
-                inputs = {
-                    "observations": self._observation_preprocessor(sampled_observations, train=True),
-                    "states": self._state_preprocessor(sampled_states, train=True),
-                }
-                next_inputs = {
-                    "observations": self._observation_preprocessor(sampled_next_observations, train=True),
-                    "states": self._state_preprocessor(sampled_next_states, train=True),
-                }
+            # Before actor learning begins, this pass is needed only to build
+            # the replay-action mask. Do not retain a policy autograd graph.
+            with torch.set_grad_enabled(update_actor):
+                with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
+                    inputs = {
+                        "observations": self._observation_preprocessor(sampled_observations, train=True),
+                        "states": self._state_preprocessor(sampled_states, train=True),
+                    }
+                    next_inputs = {
+                        "observations": self._observation_preprocessor(sampled_next_observations, train=True),
+                        "states": self._state_preprocessor(sampled_next_states, train=True),
+                    }
 
-                _, outputs = self.policy.act(inputs, role="policy")
-                action_probs, action_log_probs = self._action_distribution_from_outputs(outputs)
-                invalid_action_mask = outputs.get("invalid_action_mask", None)
+                    _, outputs = self.policy.act(inputs, role="policy")
+                    action_probs, action_log_probs = self._action_distribution_from_outputs(outputs)
+                    invalid_action_mask = outputs.get("invalid_action_mask", None)
 
-                with torch.no_grad():
-                    critic_1_values, _ = self.critic_1.act(inputs, role="critic_1")
-                    critic_2_values, _ = self.critic_2.act(inputs, role="critic_2")
-                    critic_values = torch.min(critic_1_values, critic_2_values)
+                    with torch.no_grad():
+                        critic_1_values, _ = self.critic_1.act(inputs, role="critic_1")
+                        critic_2_values, _ = self.critic_2.act(inputs, role="critic_2")
+                        critic_values = torch.min(critic_1_values, critic_2_values)
 
-                policy_loss = torch.sum(
-                    action_probs * (self._entropy_coefficient * action_log_probs - critic_values.detach()), dim=1
-                ).mean()
+                    policy_loss = torch.sum(
+                        action_probs * (self._entropy_coefficient * action_log_probs - critic_values.detach()), dim=1
+                    ).mean()
 
-            self.policy_optimizer.zero_grad()
-            self.scaler.scale(policy_loss).backward()
+            if update_actor:
+                self.policy_optimizer.zero_grad()
+                self.scaler.scale(policy_loss).backward()
 
-            if config.torch.is_distributed:
-                self.policy.reduce_parameters()
+                if config.torch.is_distributed:
+                    self.policy.reduce_parameters()
 
-            if self.cfg.policy_grad_norm_clip > 0:
-                self.scaler.unscale_(self.policy_optimizer)
-                nn.utils.clip_grad_norm_(self.policy.parameters(), self.cfg.policy_grad_norm_clip)
+                if self.cfg.policy_grad_norm_clip > 0:
+                    self.scaler.unscale_(self.policy_optimizer)
+                    nn.utils.clip_grad_norm_(self.policy.parameters(), self.cfg.policy_grad_norm_clip)
 
-            self.scaler.step(self.policy_optimizer)
+                self.scaler.step(self.policy_optimizer)
 
             with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
                 with torch.no_grad():
@@ -330,46 +382,75 @@ class DiscreteSAC(Agent):
                         * target_q_values
                     )
 
-                critic_1_values, _ = self.critic_1.act(inputs, role="critic_1")
-                critic_2_values, _ = self.critic_2.act(inputs, role="critic_2")
-                if critic_1_values.shape[1] != critic_2_values.shape[1]:
-                    raise ValueError("Discrete critics must expose the same number of actions")
-
                 gather_index = sampled_actions.long()
                 if gather_index.dim() == 1:
                     gather_index = gather_index.unsqueeze(1)
 
-                gather_index = self._sanitize_discrete_action_indices(
-                    gather_index, invalid_action_mask, num_actions=critic_1_values.shape[1]
+                def critic_loss(critic, role):
+                    values, _ = critic.act(inputs, role=role)
+                    safe_index = self._sanitize_discrete_action_indices(
+                        gather_index,
+                        invalid_action_mask,
+                        num_actions=values.shape[1],
+                    )
+                    taken_values = torch.gather(values, 1, safe_index)
+                    return F.mse_loss(taken_values, target_values), taken_values
+
+                sequential_critic_update = bool(
+                    getattr(self.cfg, "sequential_critic_update", False)
                 )
+                if sequential_critic_update:
+                    critic_1_loss, critic_1_values = critic_loss(self.critic_1, "critic_1")
+                else:
+                    critic_1_loss, critic_1_values = critic_loss(self.critic_1, "critic_1")
+                    critic_2_loss, critic_2_values = critic_loss(self.critic_2, "critic_2")
 
-                critic_1_values = torch.gather(critic_1_values, 1, gather_index)
-                critic_2_values = torch.gather(critic_2_values, 1, gather_index)
+            if sequential_critic_update:
+                self.critic1_optimizer.zero_grad()
+                self.scaler.scale(critic_1_loss).backward()
+                if config.torch.is_distributed:
+                    self.critic_1.reduce_parameters()
+                if self.cfg.q_network_grad_norm_clip > 0:
+                    self.scaler.unscale_(self.critic1_optimizer)
+                    nn.utils.clip_grad_norm_(self.critic_1.parameters(), self.cfg.q_network_grad_norm_clip)
+                self.scaler.step(self.critic1_optimizer)
+                critic_1_values = critic_1_values.detach()
+                critic_1_loss = critic_1_loss.detach()
 
-                critic_1_loss = F.mse_loss(critic_1_values, target_values)
-                critic_2_loss = F.mse_loss(critic_2_values, target_values)
+                with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
+                    critic_2_loss, critic_2_values = critic_loss(self.critic_2, "critic_2")
+                self.critic2_optimizer.zero_grad()
+                self.scaler.scale(critic_2_loss).backward()
+                if config.torch.is_distributed:
+                    self.critic_2.reduce_parameters()
+                if self.cfg.q_network_grad_norm_clip > 0:
+                    self.scaler.unscale_(self.critic2_optimizer)
+                    nn.utils.clip_grad_norm_(self.critic_2.parameters(), self.cfg.q_network_grad_norm_clip)
+                self.scaler.step(self.critic2_optimizer)
+                critic_2_values = critic_2_values.detach()
+                critic_2_loss = critic_2_loss.detach()
+            else:
+                self.critic1_optimizer.zero_grad()
+                self.critic2_optimizer.zero_grad()
+                self.scaler.scale(critic_1_loss).backward()
+                self.scaler.scale(critic_2_loss).backward()
 
-            self.critic1_optimizer.zero_grad()
-            self.critic2_optimizer.zero_grad()
-            self.scaler.scale(critic_1_loss).backward()
-            self.scaler.scale(critic_2_loss).backward()
+                if config.torch.is_distributed:
+                    self.critic_1.reduce_parameters()
+                    self.critic_2.reduce_parameters()
 
-            if config.torch.is_distributed:
-                self.critic_1.reduce_parameters()
-                self.critic_2.reduce_parameters()
+                if self.cfg.q_network_grad_norm_clip > 0:
+                    self.scaler.unscale_(self.critic1_optimizer)
+                    self.scaler.unscale_(self.critic2_optimizer)
+                    nn.utils.clip_grad_norm_(
+                        itertools.chain(self.critic_1.parameters(), self.critic_2.parameters()),
+                        self.cfg.q_network_grad_norm_clip,
+                    )
 
-            if self.cfg.q_network_grad_norm_clip > 0:
-                self.scaler.unscale_(self.critic1_optimizer)
-                self.scaler.unscale_(self.critic2_optimizer)
-                nn.utils.clip_grad_norm_(
-                    itertools.chain(self.critic_1.parameters(), self.critic_2.parameters()),
-                    self.cfg.q_network_grad_norm_clip,
-                )
+                self.scaler.step(self.critic1_optimizer)
+                self.scaler.step(self.critic2_optimizer)
 
-            self.scaler.step(self.critic1_optimizer)
-            self.scaler.step(self.critic2_optimizer)
-
-            if self.cfg.learn_entropy:
+            if self.cfg.learn_entropy and update_actor:
                 with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
                     entropy = torch.sum(action_probs * action_log_probs, dim=-1, keepdim=True)
                     entropy_loss = -(self.log_entropy_coefficient * (entropy.detach() + self._target_entropy)).mean()
@@ -384,13 +465,13 @@ class DiscreteSAC(Agent):
 
             update_target_critics(self)
 
-            if self.policy_scheduler:
+            if self.policy_scheduler and update_actor:
                 self.policy_scheduler.step()
             if self.critic1_scheduler:
                 self.critic1_scheduler.step()
             if self.critic2_scheduler:
                 self.critic2_scheduler.step()
-            if self.entropy_scheduler:
+            if self.entropy_scheduler and update_actor:
                 self.entropy_scheduler.step()
 
             if self.write_interval > 0:
@@ -410,7 +491,7 @@ class DiscreteSAC(Agent):
                 self.track_data("Target / Target (min)", torch.min(target_values).item())
                 self.track_data("Target / Target (mean)", torch.mean(target_values).item())
 
-                if self.cfg.learn_entropy:
+                if self.cfg.learn_entropy and update_actor:
                     self.track_data("Loss / Entropy loss", entropy_loss.item())
                     self.track_data("Coefficient / Entropy coefficient", self._entropy_coefficient.item())
 
