@@ -628,6 +628,7 @@ class FactorizedDiscreteSACSimple(Agent):
         rotation_actions: torch.Tensor,
         target_values: torch.Tensor,
         current_invalid_mask: torch.Tensor,
+        logits_pos: torch.Tensor,
         logits_rot_all: torch.Tensor,
         conservative_q_scale: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -643,8 +644,20 @@ class FactorizedDiscreteSACSimple(Agent):
         conservative_loss = critic_values.new_zeros(())
 
         if conservative_q_scale > 0.0:
+            # Policy variants may impose additional position restrictions on
+            # top of the environment's padding mask (for example, prescribed
+            # exploration/inspection coordination).  CQL must exclude those
+            # positions too, otherwise it regularizes actions that the actor
+            # can never take and makes the critic/policy supports disagree.
+            policy_invalid_position_mask = logits_pos.detach() <= -1e8
             current_orientation_invalid_mask = logits_rot_all.detach() <= -1e8
-            current_action_invalid_mask = current_invalid_mask.unsqueeze(-1) | current_orientation_invalid_mask
+            current_position_invalid_mask = (
+                current_invalid_mask | policy_invalid_position_mask
+            )
+            current_action_invalid_mask = (
+                current_position_invalid_mask.unsqueeze(-1)
+                | current_orientation_invalid_mask
+            )
             conservative_q_temperature = float(getattr(self.cfg, "conservative_q_temperature", 1.0))
             critic_all, _ = critic.act(
                 {**inputs, "all_position_actions": True},
@@ -653,7 +666,7 @@ class FactorizedDiscreteSACSimple(Agent):
             conservative_loss = self._conservative_q_penalty(
                 critic_all,
                 critic_values,
-                current_invalid_mask,
+                current_position_invalid_mask,
                 conservative_q_temperature,
                 current_action_invalid_mask,
             )
@@ -1240,6 +1253,7 @@ class FactorizedDiscreteSACSimple(Agent):
                         rotation_actions,
                         target_values,
                         current_invalid_mask,
+                        logits_pos,
                         logits_rot_all,
                         conservative_q_scale,
                     )
@@ -1276,6 +1290,7 @@ class FactorizedDiscreteSACSimple(Agent):
                         rotation_actions,
                         target_values,
                         current_invalid_mask,
+                        logits_pos,
                         logits_rot_all,
                         conservative_q_scale,
                     )
@@ -1319,6 +1334,7 @@ class FactorizedDiscreteSACSimple(Agent):
                         rotation_actions,
                         target_values,
                         current_invalid_mask,
+                        logits_pos,
                         logits_rot_all,
                         conservative_q_scale,
                     )
@@ -1334,6 +1350,7 @@ class FactorizedDiscreteSACSimple(Agent):
                         rotation_actions,
                         target_values,
                         current_invalid_mask,
+                        logits_pos,
                         logits_rot_all,
                         conservative_q_scale,
                     )
